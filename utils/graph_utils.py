@@ -36,7 +36,6 @@ def ocel_to_graph_with_pm4py(input_file_path, output_file_path) -> nx.DiGraph:
 
     # --- 3. Create Event Nodes ---
     print(f"Processing {len(events_df)} events...")
-    # Sort by time for HOEG control flow
     events_df = events_df.sort_values(by="ocel:timestamp")
     
     for _, row in events_df.iterrows():
@@ -68,17 +67,65 @@ def ocel_to_graph_with_pm4py(input_file_path, output_file_path) -> nx.DiGraph:
             
         G.add_edge(source, target, label=label)
 
-    print("Adding chronological control flow...")
-    # Get the list of Event IDs sorted by timestamp
-    sorted_event_ids = events_df["ocel:eid"].tolist()
+    # Add o2o and e2e relations if they exist 
+    if ocel.o2o is not None and not ocel.o2o.empty:
+        print(f"Adding {len(ocel.o2o)} Object-to-Object relations...")
+        for _, row in ocel.o2o.iterrows():
+            source = row["ocel:oid"]
+            target = row["ocel:oid_2"]
+            qualifier = row.get("ocel:qualifier", "related_to")
+            
+            # Add edge (e.g., Order -> Item)
+            G.add_edge(source, target, label=qualifier)
+
+    # --- 3b. Event-to-Event (Explicit System Flow) ---
+    # If the log contains this, it trumps timestamp sorting
+    if ocel.e2e is not None and not ocel.e2e.empty:
+        print(f"Adding {len(ocel.e2e)} explicit Event-to-Event relations...")
+        for _, row in ocel.e2e.iterrows():
+            source = row["ocel:eid"]
+            target = row["ocel:eid_2"]
+            qualifier = row.get("ocel:qualifier", "explicitly_follows")
+            
+            # Add edge
+            G.add_edge(source, target, label=qualifier)
+    else:
+        print("No explicit E2E table found.")
+
+    # We group relations by Object ID to get the specific history of *that* object
+    grouped = relations_df.groupby("ocel:oid")
     
-    # Create 'NEXT_EVENT' edges to represent the process flow
-    for i in range(len(sorted_event_ids) - 1):
-        curr_id = sorted_event_ids[i]
-        next_id = sorted_event_ids[i+1]
+    count = 0
+    for obj_id, group in grouped:
+        # Get all events for this specific object
+        related_event_ids = group["ocel:eid"].unique()
         
-        # Add edge with label (Crucial for the LLM to understand order)
-        G.add_edge(curr_id, next_id, label="NEXT_EVENT")
+        # Get the event data subset and sort by time
+        subset = events_df[events_df["ocel:eid"].isin(related_event_ids)]
+        subset = subset.sort_values("ocel:timestamp")
+        
+        sorted_ids = subset["ocel:eid"].tolist()
+        
+        # Get the object type (e.g., "purchase_order") for the edge label
+        # We look it up from the graph node we created earlier
+        obj_type = G.nodes[obj_id].get("object_type", "object")
+        
+        # Create the chain: Event A -> Event B
+        for i in range(len(sorted_ids) - 1):
+            u = sorted_ids[i]
+            v = sorted_ids[i+1]
+            
+            # Label example: "NEXT_FOR_purchase_order"
+            # This is extremely helpful for the LLM to understand context
+            edge_label = f"NEXT_FOR_{obj_type}"
+            
+            # We use a MultiGraph concept by adding a unique key if needed, 
+            # but standard DiGraph overwrites duplicate edges. 
+            # For RAG, simple connectivity is usually enough.
+            G.add_edge(u, v, label=edge_label)
+            count += 1
+            
+    print(f"Added {count} lifecycle flow edges.")
 
     # --- 6. Export ---
     print(f"Exporting to {output_file_path}...")
