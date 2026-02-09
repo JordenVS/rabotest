@@ -1,7 +1,8 @@
 #from utils.download_files import download_json_from_zenodo
 #from utils.preprocess import get_docs, get_docs_extensive, convert_to_li_document
+from utils.graph_utils import ocel_to_graph_with_pm4py, load_graphml_to_networkx, build_vocabularies_from_local_graph
 #from rag.p2prag import get_retriever, create_rag_agent, get_retriever_from_db
-from graphrag.graphrag import ocel_to_graph_with_pm4py, load_graphml_to_networkx, perform_local_search
+from graphrag.graphrag import perform_local_search
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -36,5 +37,9 @@ if __name__ == "__main__":
     # print(response)
     #graph = ocel_to_graph_with_pm4py("zenodo_json_data/ocel2-p2p.json", "p2p_graph.graphml")
     graph = load_graphml_to_networkx("p2p_graph.graphml")
-    print(perform_local_search(graph, "event:52", "Describe this event and the next step in the process."))
+    activities, object_types, qualifiers = build_vocabularies_from_local_graph(graph)
+    print(activities)
+    print(object_types)
+    print(qualifiers)
+    #print(perform_local_search(graph, "event:52", "Describe this event and the next step in the process."))
 
