@@ -37,9 +37,9 @@ if __name__ == "__main__":
     # print(response)
     graph = ocel_to_graph_with_pm4py("data/ocel2-p2p.json", "test2.graphml")
     #graph = load_graphml_to_networkx("p2p_graph.graphml")
-    #activities, object_types, qualifiers = build_vocabularies_from_local_graph(graph)
-    #print(activities)
-    #print(object_types)
-    #print(qualifiers)
+    activities, object_types, qualifiers = build_vocabularies_from_local_graph(graph)
+    print(activities)
+    print(object_types)
+    print(qualifiers)
     #print(perform_local_search(graph, "event:52", "Describe this event and the next step in the process."))
 
