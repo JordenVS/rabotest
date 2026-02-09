@@ -1,6 +1,9 @@
 import networkx as nx
 import pandas as pd
 import pm4py
+from collections import deque
+from typing import List, Dict, Any, Set
+
 
 def ocel_to_graph_with_pm4py(input_file_path, output_file_path) -> nx.DiGraph:
     print(f"Loading OCEL 2.0 log via pm4py: {input_file_path}...")
@@ -154,24 +157,103 @@ def build_vocabularies_from_local_graph(G):
 
     return activities, object_types, qualifiers
 
-def ground_entities(G, entities):
-    grounded = {
-        "event_nodes": [],
-        "object_nodes": []
-    }
+# def ground_entities(G, entities):
+#     grounded = {
+#         "event_nodes": [],
+#         "object_nodes": []
+#     }
 
-    for n, data in G.nodes(data=True):
-        if n.startswith("event:"):
-            if data.get("activity", "").lower() in entities["activities"]:
-                grounded["event_nodes"].append(n)
+#     for n, data in G.nodes(data=True):
+#         if n.startswith("event:"):
+#             if data.get("activity", "").lower() in entities["activities"]:
+#                 grounded["event_nodes"].append(n)
 
-        else:  # object node
-            if n in entities["object_instances"]:
-                grounded["object_nodes"].append(n)
-            else:
-                obj_type = n.split(":")[0].lower()
-                if obj_type in entities["object_types"]:
-                    grounded["object_nodes"].append(n)
+#         else:  # object node
+#             if n in entities["object_instances"]:
+#                 grounded["object_nodes"].append(n)
+#             else:
+#                 obj_type = n.split(":")[0].lower()
+#                 if obj_type in entities["object_types"]:
+#                     grounded["object_nodes"].append(n)
 
-    return grounded
+#     return grounded
 
+def resolve_anchor_nodes(G, ner):
+    """
+    Extract anchor nodes directly from the NER output.
+    No entity linking layer. Node IDs are already in OCEL format:
+      event:<eid>
+      <object_type>:<oid>
+    """
+    anchors = set()
+
+    # 1. Direct matches: event:<eid> and object_type:<oid>
+    for inst in ner.get("event_instances", []):
+        if inst in G:
+            anchors.add(inst)
+
+    for inst in ner.get("object_instances", []):
+        if inst in G:
+            anchors.add(inst)
+
+    # 2. Object types: include all nodes with prefix "<type>:"
+    for otype in ner.get("object_types", []):
+        prefix = f"{otype.lower()}:"
+        for n in G.nodes:
+            if n.lower().startswith(prefix):
+                anchors.add(n)
+
+    # 3. Activities: include all event nodes whose activity matches
+    for act in ner.get("activities", []):
+        target = act.lower()
+        for n, data in G.nodes(data=True):
+            if data.get("entity_type") == "Event":
+                if data.get("activity", "").lower() == target:
+                    anchors.add(n)
+
+    return anchors
+
+def enumerate_paths_unconstrained(
+    G: nx.DiGraph,
+    linked: Dict[str, Any],
+    *,
+    max_depth: int = 2,
+    max_paths: int = 20
+) -> List[List[str]]:
+    """
+    Enumerate node-paths reachable from anchors without applying semantic constraints.
+    Only bounds are max_depth and max_paths, and cycle-avoidance within each path.
+    """
+    anchors = resolve_anchor_nodes(linked)
+    if not anchors:
+        return []
+
+    paths: List[List[str]] = []
+    for anchor in anchors:
+        if anchor not in G:
+            continue
+
+        # BFS queue holds (current_node, path_so_far)
+        q = deque([(anchor, [anchor])])
+
+        while q and len(paths) < max_paths:
+            node, path = q.popleft()
+
+            if len(path) > 1:
+                # Collect all non-trivial paths
+                paths.append(path)
+                if len(paths) >= max_paths:
+                    break
+
+            # Stop expanding beyond max_depth
+            if len(path) >= max_depth:
+                continue
+
+            for nbr in G.successors(node):
+                if nbr not in path:           # simple cycle avoidance
+                    q.append((nbr, path + [nbr]))
+
+        if len(paths) >= max_paths:
+            break
+
+    return paths

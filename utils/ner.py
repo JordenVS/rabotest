@@ -27,8 +27,8 @@ def extract_entities_ocel(
     object_types_norm = [normalize(o) for o in object_types]
 
     result = {
-        "event_instances": [],     # e.g. "event:E12"
-        "object_instances": [],    # e.g. "purchase_order:PO_55"
+        "event_instances": [],     # e.g. "event:12"
+        "object_instances": [],    # e.g. "purchase_order:55"
         "object_types": [],        # e.g. "purchase_order"
         "activities": [],          # e.g. "approve purchase order"
         "constraints": []          # structured constraints

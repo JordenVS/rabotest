@@ -41,5 +41,6 @@ if __name__ == "__main__":
     print(activities)
     print(object_types)
     print(qualifiers)
-    #print(perform_local_search(graph, "event:52", "Describe this event and the next step in the process."))
+    print(perform_local_search(graph, "event:52", "Describe this event and the next step in the process."))
+    
 
