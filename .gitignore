@@ -5,3 +5,4 @@ __init__.py
 *.graphml
 data/
 faiss_db/
+.DS_Store
