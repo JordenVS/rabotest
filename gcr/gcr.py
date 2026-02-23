@@ -1,7 +1,7 @@
 import networkx as nx
 from gcr.trie import ProcessTrie
 from typing import List, Tuple
-import torch
+from transformers import AutoTokenizer
 
 def linearize_path(path, graph, sep=" "):
     """
@@ -42,15 +42,18 @@ def extract_paths(G: nx.DiGraph, start_node: str, max_depth: int = 6) -> List[Li
             stack.append((nxt, cur + [(node, rel, nxt)], d+1, visited | {nxt}))
     return paths
 
-def dump_paths_for_trie(G: nx.DiGraph, start_nodes: List[str], out_txt: str, max_depth: int = 6):
-    seen = set()
-    with open(out_txt, "w", encoding="utf-8") as f:
-        for s in start_nodes:
-            for trip_path in extract_paths(G, s, max_depth=max_depth):
-                sline = linearize_path(G, trip_path)
-                if sline not in seen:
-                    seen.add(sline)
-                    f.write(sline + "\n")
+
+def collect_unique_path_strings(G: nx.DiGraph, start_nodes: List[str], max_depth: int = 3) -> List[str]:    
+    """    Deduplicate path strings across many anchors.    """    
+    seen = set()    
+    results = []    
+    for s in start_nodes:        
+        for trip_path in extract_paths(G, s, max_depth=max_depth):            
+            sline = linearize_path(G, trip_path)            
+            if sline not in seen:                
+                seen.add(sline)                
+                results.append(sline)    
+    return results
 
 def build_trie_from_ocel(graph, start_node, tokenizer, max_depth=6):
     trie = ProcessTrie()
@@ -64,26 +67,21 @@ def build_trie_from_ocel(graph, start_node, tokenizer, max_depth=6):
         
     return trie
 
-def constrained_decode(model, tokenizer, trie, max_new_tokens=40):
-    prefix_tokens = []
-    generated = []
+def build_trie_from_path_strings(path_strings: List[str], tokenizer_name_or_obj) -> ProcessTrie:
+    """
+    path_strings: list of semantic path strings (no IDs).
+    tokenizer_name_or_obj: either a string (model name) or an instantiated tokenizer.
+    """
+    if isinstance(tokenizer_name_or_obj, str):
+        tok = AutoTokenizer.from_pretrained(tokenizer_name_or_obj, use_fast=True)
+    else:
+        tok = tokenizer_name_or_obj
 
-    for _ in range(max_new_tokens):
-        input_ids = torch.tensor([prefix_tokens], dtype=torch.long)
-        logits = model(input_ids).logits[:, -1, :]  # vocab distribution
+    trie = ProcessTrie()
+    for text in path_strings:
+        # Tokenize exactly as you will at inference time
+        ids = tok.encode(text, add_special_tokens=False)
+        if ids:
+            trie.insert(ids)
 
-        allowed = trie.allowed_next(prefix_tokens)
-        if not allowed:
-            break
-
-        # mask
-        mask = torch.full_like(logits, float('-inf'))
-        for tok in allowed:
-            if tok < logits.shape[-1]:
-                mask[0, tok] = logits[0, tok]
-
-        next_tok = torch.argmax(mask, dim=-1).item()
-        prefix_tokens.append(next_tok)
-        generated.append(next_tok)
-
-    return tokenizer.decode(generated)
+    return trie

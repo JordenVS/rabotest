@@ -3,9 +3,11 @@
 from utils.graph_utils import ocel_to_graph_with_pm4py, load_graphml_to_networkx, build_vocabularies_from_local_graph
 #from rag.p2prag import get_retriever, create_rag_agent, get_retriever_from_db
 #from graphrag.graphrag import perform_local_search
-from gcr.gcr import linearize_path, build_trie_from_ocel, extract_paths
+from gcr.gcr import build_trie_from_path_strings, linearize_path, build_trie_from_ocel, extract_paths, collect_unique_path_strings
+from gcr.logit_processor import TrieConstrainedLogitsProcessor
 from gcr.trie import ProcessTrie
 from dotenv import load_dotenv
+from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
 
 load_dotenv()
 
@@ -38,12 +40,45 @@ if __name__ == "__main__":
     # response = query_engine.query("What is a normal process in the procure to pay system?")
     # print(response)
     #graph = ocel_to_graph_with_pm4py("data/ocel2-p2p.json", "test2.graphml")
-    graph = load_graphml_to_networkx("test2.graphml")
+    #graph = load_graphml_to_networkx("test2.graphml")
    # activities, object_types, qualifiers = build_vocabularies_from_local_graph(graph)
-    paths = extract_paths(graph, "event:52", max_depth=2) 
-    linearized_paths = [linearize_path(ps, graph) for ps in paths]
-    for lp in linearized_paths:
-        print(lp)
+    # paths = extract_paths(graph, "event:52", max_depth=2) 
+    # linearized_paths = [linearize_path(ps, graph) for ps in paths]
+    # for lp in linearized_paths:
+    #     print(lp)
     #print(perform_local_search(graph, "event:52", "Describe this event and the next step in the process."))
+
+    # 1) Prepare your tokenizer & model
+    model_name = "meta-llama/Llama-3.1-8B"   # choose the model you will use
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype="auto",
+        device_map="auto"
+    )
+
+    graph = load_graphml_to_networkx("test2.graphml")
+
+    path_strings = collect_unique_path_strings(graph, ["event:52"], max_depth=6)
+
+    trie = build_trie_from_path_strings(path_strings, tokenizer)
     
+    lp = LogitsProcessorList([TrieConstrainedLogitsProcessor(trie)])
+
+    # 5) Run constrained decoding
+    prompt = (
+        "Generate a valid process path from creating a purchase order to invoice creation, "
+        "then briefly explain the steps."
+    )
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=128,
+        do_sample=False,          # start with greedy for debugging
+        logits_processor=lp       # <-- GCR constraint hook
+    )
+
+    print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+        
 
