@@ -49,28 +49,34 @@ if __name__ == "__main__":
     #print(perform_local_search(graph, "event:52", "Describe this event and the next step in the process."))
 
     # 1) Prepare your tokenizer & model
-    model_name = "meta-llama/Llama-3.1-8B"   # choose the model you will use
+    #model_name = "meta-llama/Llama-3.1-8B"   # choose the model you will use
+    model_name = "Qwen/Qwen2.5-7B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype="auto",
-        device_map="auto"
+        device_map="auto",
+        tie_word_embeddings=False
     )
 
     graph = load_graphml_to_networkx("test2.graphml")
 
-    path_strings = collect_unique_path_strings(graph, ["event:52"], max_depth=6)
+    path_strings = collect_unique_path_strings(graph, ["event:52"], max_depth=3)
+    print("First unique path strings collected for GCR:")
+    for ps in path_strings[:5]:  # Print first 5 path strings
+        print(ps)
 
     trie = build_trie_from_path_strings(path_strings, tokenizer)
-    
+    print("Trie built")
     lp = LogitsProcessorList([TrieConstrainedLogitsProcessor(trie)])
+    print("LogitsProcessor ready")
 
     # 5) Run constrained decoding
     prompt = (
-        "Generate a valid process path from creating a purchase order to invoice creation, "
-        "then briefly explain the steps."
+        "Generate a valid process path from creating a purchase order to invoice creation, then briefly explain the steps."
     )
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    print("Input prompt tokens:", inputs["input_ids"].shape)
 
     outputs = model.generate(
         **inputs,
@@ -78,6 +84,7 @@ if __name__ == "__main__":
         do_sample=False,          # start with greedy for debugging
         logits_processor=lp       # <-- GCR constraint hook
     )
+    print("Output tokens:", outputs.shape)
 
     print(tokenizer.decode(outputs[0], skip_special_tokens=True))
         

@@ -49,7 +49,7 @@ def collect_unique_path_strings(G: nx.DiGraph, start_nodes: List[str], max_depth
     results = []    
     for s in start_nodes:        
         for trip_path in extract_paths(G, s, max_depth=max_depth):            
-            sline = linearize_path(G, trip_path)            
+            sline = linearize_path(trip_path, G)            
             if sline not in seen:                
                 seen.add(sline)                
                 results.append(sline)    

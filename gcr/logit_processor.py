@@ -2,10 +2,10 @@
 # Trie and LogitProcessor
 # =========================
 import torch
-from transformers.generation.logits_process import LogitProcessor
+from transformers import LogitsProcessor
 from gcr.trie import ProcessTrie
 
-class TrieConstrainedLogitsProcessor(LogitProcessor):
+class TrieConstrainedLogitsProcessor(LogitsProcessor):
     """
     HuggingFace-native hook that masks scores so only trie-allowed next tokens remain.
     """
