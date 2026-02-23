@@ -3,7 +3,7 @@
 from utils.graph_utils import ocel_to_graph_with_pm4py, load_graphml_to_networkx, build_vocabularies_from_local_graph
 #from rag.p2prag import get_retriever, create_rag_agent, get_retriever_from_db
 #from graphrag.graphrag import perform_local_search
-from gcr.gcr import extract_paths_ocel, linearize_path, build_trie_from_ocel
+from gcr.gcr import linearize_path, build_trie_from_ocel, extract_paths
 from gcr.trie import ProcessTrie
 from dotenv import load_dotenv
 
@@ -37,11 +37,11 @@ if __name__ == "__main__":
     # query_engine = create_query_engine(kg_index, storage_context)
     # response = query_engine.query("What is a normal process in the procure to pay system?")
     # print(response)
-    graph = ocel_to_graph_with_pm4py("data/ocel2-p2p.json", "test2.graphml")
-    #graph = load_graphml_to_networkx("p2p_graph.graphml")
-    activities, object_types, qualifiers = build_vocabularies_from_local_graph(graph)
-    paths = extract_paths_ocel(graph, "event:52", max_depth=4)
-    linearized_paths = [linearize_path(p, graph) for p in paths]
+    #graph = ocel_to_graph_with_pm4py("data/ocel2-p2p.json", "test2.graphml")
+    graph = load_graphml_to_networkx("test2.graphml")
+   # activities, object_types, qualifiers = build_vocabularies_from_local_graph(graph)
+    paths = extract_paths(graph, "event:52", max_depth=2) 
+    linearized_paths = [linearize_path(ps, graph) for ps in paths]
     for lp in linearized_paths:
         print(lp)
     #print(perform_local_search(graph, "event:52", "Describe this event and the next step in the process."))

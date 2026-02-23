@@ -1,37 +1,7 @@
 import networkx as nx
 from gcr.trie import ProcessTrie
+from typing import List, Tuple
 import torch
-
-def extract_paths_ocel(graph: nx.DiGraph, start_node: str, max_depth: int = 6):
-    """
-    Extract heterogeneous OCEL paths such as:
-    Event ->(relates_to)-> Object ->(related_to)-> Object ->(NEXT_FOR_...)-> Event -> ...
-
-    Returns list of paths; each path is [(node, relation, next_node), ...]
-    """
-    paths = []
-    stack = [(start_node, [], 0, {start_node})]
-
-    while stack:
-        node, cur_path, depth, visited = stack.pop()
-
-        if depth >= max_depth or graph.out_degree(node) == 0:
-            paths.append(cur_path)
-            continue
-
-        for _, nxt, data in graph.out_edges(node, data=True):
-            relation = data.get("label", "rel")
-            if nxt in visited:
-                # prevent cycles
-                paths.append(cur_path)
-                continue
-
-            new_path = cur_path + [(node, relation, nxt)]
-            new_visited = visited | {nxt}
-
-            stack.append((nxt, new_path, depth + 1, new_visited))
-
-    return paths
 
 def linearize_path(path, graph, sep=" "):
     """
@@ -57,20 +27,6 @@ def linearize_path(path, graph, sep=" "):
 
     return sep.join(parts)
 
-# src/ocel_path_sampler.py
-import networkx as nx
-from typing import List, Tuple
-
-def node_semantic_label(G: nx.DiGraph, n: str) -> str:
-    etype = G.nodes[n].get("entity_type", "Node")
-    if etype == "Event":
-        act = G.nodes[n].get("activity", "UnknownActivity").replace(" ", "_")
-        return f"Event:{act}"
-    if etype == "Object":
-        otyp = G.nodes[n].get("object_type", "Object").replace(" ", "_")
-        return f"Object:{otyp}"
-    return etype
-
 def extract_paths(G: nx.DiGraph, start_node: str, max_depth: int = 6) -> List[List[Tuple[str, str, str]]]:
     paths, stack = [], [(start_node, [], 0, {start_node})]
     while stack:
@@ -86,14 +42,6 @@ def extract_paths(G: nx.DiGraph, start_node: str, max_depth: int = 6) -> List[Li
             stack.append((nxt, cur + [(node, rel, nxt)], d+1, visited | {nxt}))
     return paths
 
-def linearize_path(G: nx.DiGraph, path_triplets: List[Tuple[str, str, str]]) -> str:
-    parts = []
-    for u, rel, v in path_triplets:
-        parts.append(node_semantic_label(G, u))
-        parts.append(rel)
-        parts.append(node_semantic_label(G, v))
-    return " ".join(parts)
-
 def dump_paths_for_trie(G: nx.DiGraph, start_nodes: List[str], out_txt: str, max_depth: int = 6):
     seen = set()
     with open(out_txt, "w", encoding="utf-8") as f:
@@ -107,7 +55,7 @@ def dump_paths_for_trie(G: nx.DiGraph, start_nodes: List[str], out_txt: str, max
 def build_trie_from_ocel(graph, start_node, tokenizer, max_depth=6):
     trie = ProcessTrie()
     
-    paths = extract_paths_ocel(graph, start_node, max_depth=max_depth)
+    paths = extract_paths(graph, start_node, max_depth=max_depth)
     
     for path in paths:
         txt = linearize_path(path, graph)
