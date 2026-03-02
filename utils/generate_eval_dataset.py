@@ -213,14 +213,20 @@ def make_cross_level_questions(G, petri_model, num=20):
 # ========================================
 # Main: build dataset files
 # ========================================
-
-def build_all_datasets(G_ocel, petri_model, out_prefix="eval"):
+def build_all_datasets(G_ocel, out_prefix="eval"):
+#def build_all_datasets(G_ocel, petri_model, out_prefix="eval"):
     local = make_local_questions(G_ocel)
-    global_q = make_global_questions(petri_model)
-    cross = make_cross_level_questions(G_ocel, petri_model)
+    localobj = make_local_object_questions(G_ocel)
+    #global_q = make_global_questions(petri_model)
+    #cross = make_cross_level_questions(G_ocel, petri_model)
 
     with open(f"{out_prefix}_local.jsonl", "w") as f:
         for q in local:
+            f.write(json.dumps(q) + "\n")
+
+
+    with open(f"{out_prefix}_localobj.jsonl", "w") as f:
+        for q in localobj:
             f.write(json.dumps(q) + "\n")
 
     # with open(f"{out_prefix}_global.jsonl", "w") as f:

@@ -85,3 +85,81 @@ def build_trie_from_path_strings(path_strings: List[str], tokenizer_name_or_obj)
             trie.insert(ids)
 
     return trie
+
+def serialize_ocel_path(G, path_nodes):
+    """
+    Converts a list of node IDs from your graph into a GCR-standard string.
+    Example: Event:Create_PO -> Object:Order_123 -> Event:Approve_PO
+    """
+    serialized_parts = []
+    for i in range(len(path_nodes)):
+        node_id = path_nodes[i]
+        attr = G.nodes[node_id]
+        
+        if attr["entity_type"] == "Event":
+            label = f"Event:{attr['activity']}"
+        else:
+            label = f"Object:{attr['object_type']}" # We use type for general paths
+        
+        serialized_parts.append(label)
+        
+        # Add the relationship label if there's a next node
+        if i < len(path_nodes) - 1:
+            edge_data = G.get_edge_data(node_id, path_nodes[i+1])
+            rel = edge_data.get("label", "relates_to")
+            serialized_parts.append(f" [{rel}] ")
+            
+    return "".join(serialized_parts)
+
+def get_constrained_trie(G, start_node_id, tokenizer, max_hops=3):
+    # 1. Find all paths in the graph starting from the seed (e.g., Order_123)
+    # This uses your existing extract_paths logic
+    raw_paths = extract_paths(G, start_node_id, max_depth=max_hops)
+    
+    trie = ProcessTrie()
+    for p in raw_paths:
+        # Convert path (list of triples) to flat list of nodes
+        node_sequence = [p[0][0]] + [step[2] for step in p]
+        
+        # 2. Serialize to string
+        path_str = serialize_ocel_path(G, node_sequence)
+        
+        # 3. Tokenize with the leading space (GCR requirement)
+        token_ids = tokenizer.encode(" " + path_str, add_special_tokens=False)
+        
+        # 4. Insert into Trie
+        trie.insert(token_ids)
+        # Allow the LLM to stop at any valid event completion
+        trie.insert(token_ids + [tokenizer.eos_token_id])
+        
+    return trie
+
+def run_gcr_audit(G, tokenizer, model, object_id, question):
+    # 1. Build the Trie for this specific Object ID
+    # This acts as the 'allowed' map for the LLM
+    trie = get_constrained_trie(G, object_id, tokenizer)
+    
+    # 2. Prepare the Prompt
+    prompt = f"Audit Question: {question}\nTarget: {object_id}\nValid Process Path:"
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    prompt_len = inputs.input_ids.shape[1]
+    
+    # 3. Setup the GCR Logits Processor
+    # (Using the GCRProcessProcessor class we drafted earlier)
+    from .processors import GCRProcessProcessor
+    logits_processor = LogitsProcessorList([
+        GCRProcessProcessor(trie, [prompt_len], tokenizer)
+    ])
+    
+    # 4. Generate (Constrained)
+    output_ids = model.generate(
+        **inputs,
+        max_new_tokens=150,
+        logits_processor=logits_processor,
+        num_beams=5,
+        num_return_sequences=1 # Or more if you want multiple valid paths
+    )
+    
+    # 5. Decode
+    full_path = tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True)
+    return full_path
