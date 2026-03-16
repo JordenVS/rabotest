@@ -2,7 +2,7 @@ import torch
 import networkx as nx
 from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList
 from typing import List
-from .gcr import collect_unique_path_strings, build_trie_from_path_strings
+from .gcr import collect_unique_path_strings, build_trie_from_path_strings, serialize_ocel_paths_v2
 
 # 1. THE CONSTRAINED PROCESSOR (GCR CORE)
 class GCRProcessProcessor(torch.nn.Module):
@@ -58,6 +58,7 @@ class GCRProcessAgent:
         """
         
         paths = collect_unique_path_strings(self.graph, [seed_node], max_depth=max_depth)
+       # ser_paths = serialize_ocel_paths_v2(self.graph, paths) TODO: Fix serialization.
         # Ensure we add a specific 'Path Start' anchor if needed
         return build_trie_from_path_strings(paths, self.tokenizer)
 
@@ -93,7 +94,6 @@ class GCRProcessAgent:
         paths = [self.tokenizer.decode(g[prompt_len:], skip_special_tokens=True) for g in output_ids]
         return paths
 
-# 3. EXECUTION FLOW
 # graph = load_ocel_to_networkx("logs.jsonocel")
 # agent = GCRProcessAgent("meta-llama/Llama-3-8b", graph)
 # results = agent.generate_compliant_paths("Order_99", "What happens after payment?")

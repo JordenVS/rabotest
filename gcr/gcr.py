@@ -111,6 +111,30 @@ def serialize_ocel_path(G, path_nodes):
             
     return "".join(serialized_parts)
 
+def serialize_ocel_path_v2(G, path_nodes):
+    parts = []
+    for i in range(len(path_nodes)):
+        curr_node = path_nodes[i]
+        attr = G.nodes[curr_node]
+        
+        # 1. Add the Node with a clear Prefix
+        if attr["entity_type"] == "Event":
+            parts.append(f"Event:{attr['activity']}")
+        else:
+            parts.append(f"Object:{attr['object_type']}")
+            
+        # 2. Add the Edge/Relation ONLY if there is a next node
+        if i < len(path_nodes) - 1:
+            next_node = path_nodes[i+1]
+            edge_data = G.get_edge_data(curr_node, next_node)
+            # If MultiDiGraph, edge_data might be a dict of dicts
+            rel_label = edge_data.get("label", "related_to")
+            
+            # Use arrows and brackets to give the LLM structural cues
+            parts.append(f" --({rel_label})--> ")
+            
+    return "".join(parts)
+
 def get_constrained_trie(G, start_node_id, tokenizer, max_hops=3):
     # 1. Find all paths in the graph starting from the seed (e.g., Order_123)
     # This uses your existing extract_paths logic
@@ -122,7 +146,7 @@ def get_constrained_trie(G, start_node_id, tokenizer, max_hops=3):
         node_sequence = [p[0][0]] + [step[2] for step in p]
         
         # 2. Serialize to string
-        path_str = serialize_ocel_path(G, node_sequence)
+        path_str = serialize_ocel_path_v2(G, node_sequence)
         
         # 3. Tokenize with the leading space (GCR requirement)
         token_ids = tokenizer.encode(" " + path_str, add_special_tokens=False)

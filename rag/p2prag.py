@@ -8,18 +8,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-def get_retriever(docs):
+def get_retriever(docs, db_path):
     # Chunk loaded documents
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     chunked_docs = splitter.split_documents(docs)
 
     # Set embedding model
     print("Fetching embeddings...")
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")  # TODO: try other embedding models here as well
     
     print("Creating vectorstore...")
     faiss_vectorstore = FAISS.from_documents(chunked_docs, embeddings)
-    faiss_vectorstore.save_local("./faiss_db")
+    faiss_vectorstore.save_local(db_path)
 
     print("Creating retriever...")
     retriever = faiss_vectorstore.as_retriever(search_type="similarity", search_kwargs={"k":5})
@@ -27,8 +27,8 @@ def get_retriever(docs):
     print("Retriever is ready.")
     return retriever
 
-def get_retriever_from_db():
-    faiss_vectorstore = FAISS.load_local("./faiss_db", embeddings= OpenAIEmbeddings(model="text-embedding-3-small"), allow_dangerous_deserialization=True)
+def get_retriever_from_db(path):
+    faiss_vectorstore = FAISS.load_local(path, embeddings= OpenAIEmbeddings(model="text-embedding-3-small"), allow_dangerous_deserialization=True)
     retriever = faiss_vectorstore.as_retriever(search_type="similarity", search_kwargs={"k":5})
     return retriever
 
@@ -47,7 +47,7 @@ def make_retrieval_middleware(retriever):
 def create_rag_agent(retriever):
     print("Creating RAG agent...")
     agent = create_agent(
-        model= ChatOpenAI(model="gpt-4o-mini"),
+        model= ChatOpenAI(model="gpt-4o-mini"), # TODO: Change to standard model used for other experiments
         tools = [],
         middleware=[make_retrieval_middleware(retriever)]
     )
