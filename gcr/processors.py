@@ -2,7 +2,7 @@ import torch
 import networkx as nx
 from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList
 from typing import List
-from .gcr import collect_unique_path_strings, build_trie_from_path_strings, serialize_ocel_paths_v2
+from .gcr import collect_unique_path_strings, build_trie_from_path_strings
 
 # 1. THE CONSTRAINED PROCESSOR (GCR CORE)
 class GCRProcessProcessor(torch.nn.Module):

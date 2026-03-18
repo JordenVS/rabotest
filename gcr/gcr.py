@@ -14,7 +14,8 @@ def linearize_path(path, graph, sep=" "):
         # Describe the current node
         node_type = graph.nodes[node].get("entity_type", "Node")
         node_label = graph.nodes[node].get("activity", graph.nodes[node].get("object_type", ""))
-        node_str = f"{node_type}:{node_label}" if node_label else f"{node_type}:{node}"
+        #node_str = f"{node_type}:{node_label}" if node_label else f"{node_type}:{node}"
+        node_str = f"{node_type}:{node_label.replace(' ', '_')}" if node_label else f"{node_type}:{node}"
 
         # Describe the next node
         nxt_type = graph.nodes[nxt].get("entity_type", "Node")

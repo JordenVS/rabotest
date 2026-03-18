@@ -7,3 +7,4 @@ data/
 faiss_db/
 .DS_Store
 .python-version
+claude/
