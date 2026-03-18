@@ -1,6 +1,7 @@
 #from utils.download_files import download_json_from_zenodo
 from utils.preprocess import get_docs, get_docs_extensive, convert_to_li_document
-#from gcr.processors import GCRProcessAgent
+from gcr.processors import GCRProcessAgent
+from gcr.processors2 import GCRProcessAgent as GCRProcessAgent2
 from utils.preprocess_pm4py import get_docs_from_pm4py
 from utils.graph_utils import ocel_to_graph_with_pm4py, load_graphml_to_networkx, build_vocabularies_from_local_graph
 from utils.generate_eval_dataset import build_all_datasets
@@ -18,7 +19,7 @@ if __name__ == "__main__":
     #RECORD_ID = "8412920"
     #download_json_from_zenodo(RECORD_ID, output_dir="./zenodo_json_data")
     #docs = get_docs("zenodo_json_data/ocel2-p2p.json")
-    docs = get_docs_extensive("data/ocel2-p2p.json")
+    #docs = get_docs_extensive("data/ocel2-p2p.json")
 
     # docs.sort(key=lambda d: d.metadata.get("id", ""))
     # for doc in docs[:10]:
@@ -29,15 +30,15 @@ if __name__ == "__main__":
     # retriever = get_retriever(docs, "./faiss_db_ext")
     # print("Retriever is ready.")
 
-    docs = get_docs_from_pm4py("data/ocel2-p2p.json")
-    docs.sort(key=lambda d: d.metadata.get("id", ""))
-    for doc in docs[:10]:
-         print(f"--- Document ID: {doc.metadata['id']} ---")
-         print(doc.text) 
-         print("\n")
+    #docs = get_docs_from_pm4py("data/ocel2-p2p.json")
+    #docs.sort(key=lambda d: d.metadata.get("id", ""))
+    #for doc in docs[:10]:
+    #     print(f"--- Document ID: {doc.metadata['id']} ---")
+    #     print(doc.text) 
+    #     print("\n")
     # print("Creating RAG agent...")
-    retriever = get_retriever(docs, "./faiss_db_pm4py")
-    retriever = get_retriever_from_db("./faiss_db_pm4py")
+    #retriever = get_retriever(docs, "./faiss_db_pm4py")
+    #retriever = get_retriever_from_db("./faiss_db_pm4py")
     # agent = create_rag_agent(retriever)
     # print("RAG agent is ready.")
 
@@ -108,9 +109,10 @@ if __name__ == "__main__":
 
     # build_all_datasets(graph, out_prefix="eval")
         
-    # graph = load_graphml_to_networkx("test2.graphml")
-    # agent = GCRProcessAgent("Qwen/Qwen2.5-1.5B-Instruct", graph)
+    graph = load_graphml_to_networkx("test2.graphml")
+    agent = GCRProcessAgent2("Qwen/Qwen2.5-1.5B-Instruct", graph)
     # #agent = GCRProcessAgent("Qwen/Qwen2.5-7B-Instruct", graph)
-    # #results = agent.generate_compliant_paths("event:52", "What happens after event:52?")
-    # results = agent.generate_compliant_paths("event:3885", "What happens after event:3885? What objects are involved?")
-    # print(results)
+    #results = agent.generate_compliant_paths("event:52", "What happens after event:52?")
+    #results = agent.generate_compliant_paths("event:3885", "What happens after event:3885? What objects are involved?")
+    results = agent.generate_compliant_paths("event:11991", "What happens after event:11991? What objects are involved?")
+    print(results)

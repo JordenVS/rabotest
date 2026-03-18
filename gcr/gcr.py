@@ -1,77 +1,170 @@
+"""
+gcr/gcr.py
+----------
+Core GCR utilities for OCEL 2.0 process-aware graphs.
+
+Serialization contract (all functions use this format)
+-------------------------------------------------------
+A path over nodes [n0, n1, n2, ...] is serialized as the *chain*:
+
+    label(n0) rel_01 label(n1) rel_12 label(n2) ...
+
+where label() is:
+    Event nodes   → "Event:<activity_with_underscores>"
+    Object nodes  → "Object:<object_type_with_underscores>"
+
+Tokens are separated by a single space.
+
+This format is used consistently by:
+  - linearize_path          (trie construction)
+  - linearize_triplets / node_semantic_label  (ground-truth dataset)
+  - get_constrained_trie    (alternate trie entry-point)
+"""
+
 import networkx as nx
 from gcr.trie import ProcessTrie
 from typing import List, Tuple
 from transformers import AutoTokenizer
 
-def linearize_path(path, graph, sep=" "):
+
+# ---------------------------------------------------------------------------
+# Canonical node label  (single source of truth)
+# ---------------------------------------------------------------------------
+
+def node_label(G: nx.DiGraph, node_id: str) -> str:
     """
-    Convert [(node, rel, nxt), ...] into:
-    "Event:CreatePO NEXT_FOR_purchase_order Event:ApprovePO ..."
+    Return the canonical semantic label for *node_id*.
+
+    Format:  "Event:<Activity_With_Underscores>"
+             "Object:<object_type_with_underscores>"
+
+    Spaces in activity / object_type names are replaced with underscores so
+    that the label is a single token-friendly unit.  This matches the format
+    used by node_semantic_label() in generate_eval_dataset.py.
+    """
+    data = G.nodes[node_id]
+    entity_type = data.get("entity_type", "Node")
+    if entity_type == "Event":
+        raw = data.get("activity", node_id)
+    else:
+        raw = data.get("object_type", node_id)
+    return f"{entity_type}:{raw.replace(' ', '_')}"
+
+
+# ---------------------------------------------------------------------------
+# Path linearization  (chain format, no duplicate interior nodes)
+# ---------------------------------------------------------------------------
+
+def linearize_path(
+    path: List[Tuple[str, str, str]],
+    graph: nx.DiGraph,
+    sep: str = " ",
+) -> str:
+    """
+    Convert a list of (node, rel, nxt) triples into a chain string:
+
+        label(n0) rel_01 label(n1) rel_12 label(n2) ...
+
+    Interior nodes are emitted exactly once.  For an empty path, returns "".
+
+    Parameters
+    ----------
+    path  : List of (src_id, relation_label, tgt_id) triples produced by
+            extract_paths().  The relation label is already underscore-normalised
+            by extract_paths().
+    graph : The NetworkX DiGraph (needed to look up node attributes).
+    sep   : Token separator (default single space, matching tokenizer default).
     """
     parts = []
-
-    for node, rel, nxt in path:
-        # Describe the current node
+    for i, (node, rel, nxt) in enumerate(path):
         node_type = graph.nodes[node].get("entity_type", "Node")
-        node_label = graph.nodes[node].get("activity", graph.nodes[node].get("object_type", ""))
-        #node_str = f"{node_type}:{node_label}" if node_label else f"{node_type}:{node}"
-        node_str = f"{node_type}:{node_label.replace(' ', '_')}" if node_label else f"{node_type}:{node}"
-
-        # Describe the next node
-        nxt_type = graph.nodes[nxt].get("entity_type", "Node")
-        nxt_label = graph.nodes[nxt].get("activity", graph.nodes[nxt].get("object_type", ""))
-        nxt_str = f"{nxt_type}:{nxt_label}" if nxt_label else f"{nxt_type}:{nxt}"
-
-        parts.append(node_str)
+        node_label = graph.nodes[node].get("activity", graph.nodes[node].get("object_type", node))
+        parts.append(f"{node_type}:{node_label}")
         parts.append(rel)
-        parts.append(nxt_str)
-
+        if i == len(path) - 1:  # append final node only once
+            nxt_type = graph.nodes[nxt].get("entity_type", "Node")
+            nxt_label = graph.nodes[nxt].get("activity", graph.nodes[nxt].get("object_type", nxt))
+            parts.append(f"{nxt_type}:{nxt_label}")
     return sep.join(parts)
 
-def extract_paths(G: nx.DiGraph, start_node: str, max_depth: int = 6) -> List[List[Tuple[str, str, str]]]:
-    paths, stack = [], [(start_node, [], 0, {start_node})]
+# ---------------------------------------------------------------------------
+# Path extraction
+# ---------------------------------------------------------------------------
+
+def extract_paths(
+    G: nx.DiGraph,
+    start_node: str,
+    max_depth: int = 6,
+) -> List[List[Tuple[str, str, str]]]:
+    """
+    DFS enumeration of all simple paths starting from *start_node* up to
+    *max_depth* hops.  Cycles are broken by per-path visited sets.
+
+    Returns a list of paths, each path being a list of (src, rel, tgt) triples.
+    Relation labels have spaces normalised to underscores.
+    """
+    paths: List[List[Tuple[str, str, str]]] = []
+    stack = [(start_node, [], 0, {start_node})]
+
     while stack:
         node, cur, d, visited = stack.pop()
         if d >= max_depth or G.out_degree(node) == 0:
-            if cur: paths.append(cur)
+            if cur:
+                paths.append(cur)
             continue
         for _, nxt, data in G.out_edges(node, data=True):
             rel = str(data.get("label", "rel")).replace(" ", "_")
             if nxt in visited:
-                if cur: paths.append(cur)  # terminate on cycle
+                if cur:
+                    paths.append(cur)   # terminate on cycle, keep partial path
                 continue
-            stack.append((nxt, cur + [(node, rel, nxt)], d+1, visited | {nxt}))
+            stack.append((nxt, cur + [(node, rel, nxt)], d + 1, visited | {nxt}))
+
     return paths
 
 
-def collect_unique_path_strings(G: nx.DiGraph, start_nodes: List[str], max_depth: int = 3) -> List[str]:    
-    """    Deduplicate path strings across many anchors.    """    
-    seen = set()    
-    results = []    
-    for s in start_nodes:        
-        for trip_path in extract_paths(G, s, max_depth=max_depth):            
-            sline = linearize_path(trip_path, G)            
-            if sline not in seen:                
-                seen.add(sline)                
-                results.append(sline)    
+# ---------------------------------------------------------------------------
+# Bulk path-string collection (used by GCRProcessAgent)
+# ---------------------------------------------------------------------------
+
+def collect_unique_path_strings(
+    G: nx.DiGraph,
+    start_nodes: List[str],
+    max_depth: int = 3,
+) -> List[str]:
+    """
+    Enumerate and deduplicate chain-format path strings across all *start_nodes*.
+
+    Returns
+    -------
+    List[str]  — unique linearised path strings, each in canonical format.
+    """
+    seen: set = set()
+    results: List[str] = []
+    for s in start_nodes:
+        for trip_path in extract_paths(G, s, max_depth=max_depth):
+            s_line = linearize_path(trip_path, G)
+            if s_line and s_line not in seen:
+                seen.add(s_line)
+                results.append(s_line)
     return results
 
-def build_trie_from_ocel(graph, start_node, tokenizer, max_depth=6):
-    trie = ProcessTrie()
-    
-    paths = extract_paths(graph, start_node, max_depth=max_depth)
-    
-    for path in paths:
-        txt = linearize_path(path, graph)
-        toks = tokenizer.encode(txt)
-        trie.insert(toks)
-        
-    return trie
 
-def build_trie_from_path_strings(path_strings: List[str], tokenizer_name_or_obj) -> ProcessTrie:
+# ---------------------------------------------------------------------------
+# Trie construction
+# ---------------------------------------------------------------------------
+
+def build_trie_from_path_strings(
+    path_strings: List[str],
+    tokenizer_name_or_obj,
+) -> ProcessTrie:
     """
-    path_strings: list of semantic path strings (no IDs).
-    tokenizer_name_or_obj: either a string (model name) or an instantiated tokenizer.
+    Build a ProcessTrie from a list of canonical path strings.
+
+    Parameters
+    ----------
+    path_strings         : Output of collect_unique_path_strings().
+    tokenizer_name_or_obj: HuggingFace tokenizer instance or model-name string.
     """
     if isinstance(tokenizer_name_or_obj, str):
         tok = AutoTokenizer.from_pretrained(tokenizer_name_or_obj, use_fast=True)
@@ -80,111 +173,63 @@ def build_trie_from_path_strings(path_strings: List[str], tokenizer_name_or_obj)
 
     trie = ProcessTrie()
     for text in path_strings:
-        # Tokenize exactly as you will at inference time
         ids = tok.encode(text, add_special_tokens=False)
         if ids:
             trie.insert(ids)
-
     return trie
 
-def serialize_ocel_path(G, path_nodes):
-    """
-    Converts a list of node IDs from your graph into a GCR-standard string.
-    Example: Event:Create_PO -> Object:Order_123 -> Event:Approve_PO
-    """
-    serialized_parts = []
-    for i in range(len(path_nodes)):
-        node_id = path_nodes[i]
-        attr = G.nodes[node_id]
-        
-        if attr["entity_type"] == "Event":
-            label = f"Event:{attr['activity']}"
-        else:
-            label = f"Object:{attr['object_type']}" # We use type for general paths
-        
-        serialized_parts.append(label)
-        
-        # Add the relationship label if there's a next node
-        if i < len(path_nodes) - 1:
-            edge_data = G.get_edge_data(node_id, path_nodes[i+1])
-            rel = edge_data.get("label", "relates_to")
-            serialized_parts.append(f" [{rel}] ")
-            
-    return "".join(serialized_parts)
 
-def serialize_ocel_path_v2(G, path_nodes):
-    parts = []
-    for i in range(len(path_nodes)):
-        curr_node = path_nodes[i]
-        attr = G.nodes[curr_node]
-        
-        # 1. Add the Node with a clear Prefix
-        if attr["entity_type"] == "Event":
-            parts.append(f"Event:{attr['activity']}")
-        else:
-            parts.append(f"Object:{attr['object_type']}")
-            
-        # 2. Add the Edge/Relation ONLY if there is a next node
-        if i < len(path_nodes) - 1:
-            next_node = path_nodes[i+1]
-            edge_data = G.get_edge_data(curr_node, next_node)
-            # If MultiDiGraph, edge_data might be a dict of dicts
-            rel_label = edge_data.get("label", "related_to")
-            
-            # Use arrows and brackets to give the LLM structural cues
-            parts.append(f" --({rel_label})--> ")
-            
-    return "".join(parts)
+def build_trie_from_ocel(
+    graph: nx.DiGraph,
+    start_node: str,
+    tokenizer,
+    max_depth: int = 6,
+) -> ProcessTrie:
+    """Convenience wrapper: extract paths from *start_node*, build trie."""
+    path_strings = collect_unique_path_strings(graph, [start_node], max_depth=max_depth)
+    return build_trie_from_path_strings(path_strings, tokenizer)
 
-def get_constrained_trie(G, start_node_id, tokenizer, max_hops=3):
-    # 1. Find all paths in the graph starting from the seed (e.g., Order_123)
-    # This uses your existing extract_paths logic
-    raw_paths = extract_paths(G, start_node_id, max_depth=max_hops)
-    
-    trie = ProcessTrie()
-    for p in raw_paths:
-        # Convert path (list of triples) to flat list of nodes
-        node_sequence = [p[0][0]] + [step[2] for step in p]
-        
-        # 2. Serialize to string
-        path_str = serialize_ocel_path_v2(G, node_sequence)
-        
-        # 3. Tokenize with the leading space (GCR requirement)
-        token_ids = tokenizer.encode(" " + path_str, add_special_tokens=False)
-        
-        # 4. Insert into Trie
-        trie.insert(token_ids)
-        # Allow the LLM to stop at any valid event completion
-        trie.insert(token_ids + [tokenizer.eos_token_id])
-        
-    return trie
+
+def get_constrained_trie(
+    G: nx.DiGraph,
+    start_node_id: str,
+    tokenizer,
+    max_hops: int = 3,
+) -> ProcessTrie:
+    """
+    Alternative entry point (used by run_gcr_audit).
+    Previously used serialize_ocel_path_v2 with arrow syntax — now unified
+    to use linearize_path so all trie strings are in the same format.
+    """
+    return build_trie_from_ocel(G, start_node_id, tokenizer, max_depth=max_hops)
+
+
+# ---------------------------------------------------------------------------
+# Audit helper (kept for backward compatibility)
+# ---------------------------------------------------------------------------
 
 def run_gcr_audit(G, tokenizer, model, object_id, question):
-    # 1. Build the Trie for this specific Object ID
-    # This acts as the 'allowed' map for the LLM
+    """
+    Run a single constrained-decoding query for *object_id* and return the
+    decoded path string.
+    """
+    from transformers import LogitsProcessorList
+    from gcr.processors import GCRProcessProcessor
+
     trie = get_constrained_trie(G, object_id, tokenizer)
-    
-    # 2. Prepare the Prompt
+
     prompt = f"Audit Question: {question}\nTarget: {object_id}\nValid Process Path:"
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     prompt_len = inputs.input_ids.shape[1]
-    
-    # 3. Setup the GCR Logits Processor
-    # (Using the GCRProcessProcessor class we drafted earlier)
-    from .processors import GCRProcessProcessor
-    logits_processor = LogitsProcessorList([
-        GCRProcessProcessor(trie, [prompt_len], tokenizer)
-    ])
-    
-    # 4. Generate (Constrained)
+
+    logits_processor = LogitsProcessorList(
+        [GCRProcessProcessor(trie, [prompt_len], tokenizer)]
+    )
     output_ids = model.generate(
         **inputs,
         max_new_tokens=150,
         logits_processor=logits_processor,
         num_beams=5,
-        num_return_sequences=1 # Or more if you want multiple valid paths
+        num_return_sequences=1,
     )
-    
-    # 5. Decode
-    full_path = tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True)
-    return full_path
+    return tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True)
