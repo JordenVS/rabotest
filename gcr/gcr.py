@@ -79,11 +79,13 @@ def linearize_path(
     for i, (node, rel, nxt) in enumerate(path):
         node_type = graph.nodes[node].get("entity_type", "Node")
         node_label = graph.nodes[node].get("activity", graph.nodes[node].get("object_type", node))
+        node_label = node_label.replace(" ", "_")  
         parts.append(f"{node_type}:{node_label}")
         parts.append(rel)
         if i == len(path) - 1:  # append final node only once
             nxt_type = graph.nodes[nxt].get("entity_type", "Node")
             nxt_label = graph.nodes[nxt].get("activity", graph.nodes[nxt].get("object_type", nxt))
+            nxt_label = nxt_label.replace(" ", "_")
             parts.append(f"{nxt_type}:{nxt_label}")
     return sep.join(parts)
 

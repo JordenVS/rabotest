@@ -295,8 +295,8 @@ def build_all_datasets(
     local = make_local_questions(G_ocel, num=num_local, seed=seed)
     localobj = make_local_object_questions(G_ocel, num=num_object, seed=seed)
 
-    local_path = f"{out_prefix}_local.jsonl"
-    obj_path = f"{out_prefix}_localobj.jsonl"
+    local_path = f"eval/data/{out_prefix}_local.jsonl"
+    obj_path = f"eval/data/{out_prefix}_localobj.jsonl"
 
     with open(local_path, "w") as f:
         for q in local:
