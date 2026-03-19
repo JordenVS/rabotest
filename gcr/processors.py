@@ -3,17 +3,6 @@ gcr/processors.py
 -----------------
 GCR logits processor and high-level agent for OCEL 2.0 process graphs.
 
-Fixes vs. original
-~~~~~~~~~~~~~~~~~~
-1. Removed the broken import of `serialize_ocel_paths_v2` (function does not
-   exist in gcr.gcr; serialization now happens inside gcr.gcr.collect_unique_path_strings
-   via linearize_path, which is consistent with the trie-building pipeline).
-2. Fixed a ZeroDivisionError in the beam-search prompt_idx calculation that
-   occurred when batch_size == len(self.prompt_lens)  (single-prompt beam search).
-   The correct formula is:  beam_width = batch_size // len(prompt_lens)
-   so prompt_idx = b // beam_width, guarded against beam_width == 0.
-3. Added EOS to the allowed set when trie is exhausted, instead of hard-zeroing
-   all scores (prevents infinite generation loops).
 """
 
 import time

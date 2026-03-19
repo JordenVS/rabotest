@@ -1,27 +1,37 @@
 """
 eval/run_evaluation.py
 -----------------------
-Orchestrates the full evaluation pipeline comparing three approaches:
+Orchestrates the full evaluation pipeline comparing four approaches:
 
   1. GCR (constrained)      — trie-constrained beam search (this work)
   2. Unconstrained baseline — same model, no trie ("GCR w/o constraint"
                               in the ablation study of Luo et al., 2024)
   3. GraphRAG baseline      — 1-hop subgraph context + LLM generation
                               (graphrag/graphrag.py)
+  4. RAG baseline           — dense retrieval + LLM generation
+                              (rag/p2prag.py)
 
 For each approach and each eval item the script records every metric defined
 in eval/metrics.py, writes per-item JSONL results, and prints a summary table.
 
+Note on path-based metrics for RAG:
+    RAG returns free-text answers, not structured reasoning paths. Metrics
+    such as path_f1 and constraint_compliance will therefore be near-zero
+    for RAG by design — this is the correct result for a flat retrieval
+    baseline and should be reported as such in the paper.
+
 Usage
 -----
     python -m eval.run_evaluation \
-        --graph       test2.graphml \
-        --eval-local  eval_local.jsonl \
-        --eval-obj    eval_localobj.jsonl \
-        --model       Qwen/Qwen2.5-1.5B-Instruct \
-        --num-paths   3 \
-        --max-depth   3 \
-        --out-dir     results/
+        --graph         test2.graphml \
+        --eval-local    eval_local.jsonl \
+        --eval-obj      eval_localobj.jsonl \
+        --model         Qwen/Qwen2.5-1.5B-Instruct \
+        --faiss-db      ./faiss_db_pm4py \
+        --embedding     bge \
+        --num-paths     3 \
+        --max-depth     3 \
+        --out-dir       results/
 
 All CLI arguments have sensible defaults so the script can be run with just
     python -m eval.run_evaluation
@@ -65,9 +75,24 @@ def _load_gcr_agent(model_id: str, graph: nx.DiGraph, device: str = "cpu"):
     return GCRProcessAgent(model_id, graph, device=device)
 
 
-def _load_graphrag_fn():
-    from graphrag.graphrag import perform_local_search
-    return perform_local_search
+def _load_graphrag(model_id: str):
+    """Load GraphRAG search function and a pre-built LLM callable."""
+    from graphrag.graphrag import perform_local_search, build_graphrag_llm
+    print(f"Loading GraphRAG model: {model_id}")
+    llm = build_graphrag_llm(backend="hf", model=model_id)
+    return perform_local_search, llm
+
+
+def _load_rag_chain(faiss_db: str, embedding_backend: str, llm_model: str):
+    """Load FAISS index and build the RAG chain."""
+    from rag.p2prag import get_retriever_from_db, create_rag_chain
+    retriever = get_retriever_from_db(faiss_db, embedding_backend=embedding_backend)
+    chain = create_rag_chain(
+        retriever,
+        llm_backend="hf",
+        llm_model=llm_model,
+    )
+    return chain
 
 
 # ---------------------------------------------------------------------------
@@ -160,9 +185,10 @@ def run_graphrag(
     items: List[Dict],
     graph: nx.DiGraph,
     valid_edges,
+    perform_local_search,
+    llm,
 ) -> List[Dict]:
     """Run GraphRAG local-search baseline over *items*."""
-    perform_local_search = _load_graphrag_fn()
     results = []
 
     for i, item in enumerate(items):
@@ -175,7 +201,7 @@ def run_graphrag(
             generated_paths = []
         else:
             try:
-                response = perform_local_search(graph, seed_entity, question)
+                response = perform_local_search(graph, seed_entity, question, llm=llm)
                 generated_paths = _graphrag_paths_from_response(response)
             except Exception as e:
                 print(f"  [graphrag] item {item['id']} failed: {e}")
@@ -195,6 +221,55 @@ def run_graphrag(
 
         if (i + 1) % 10 == 0:
             print(f"  [graphrag] {i + 1}/{len(items)} done")
+
+    return results
+
+
+def run_rag(
+    items: List[Dict],
+    chain,
+    graph: nx.DiGraph,
+    valid_edges,
+) -> List[Dict]:
+    """
+    Run the dense RAG baseline over *items*.
+
+    The chain returns {"question", "context", "answer"} where "answer" is
+    free text. Following the same convention as run_graphrag, the answer is
+    wrapped as a single-element path list for metric computation. Path-based
+    metrics (path_f1, constraint_compliance) will therefore be near-zero by
+    design and should be interpreted accordingly in the paper.
+    """
+    results = []
+
+    for i, item in enumerate(items):
+        question = item["question"]
+
+        t0 = time.perf_counter()
+        try:
+            output = chain.invoke({"question": question})
+            answer_text = output.get("answer", "")
+            # Wrap free-text answer as a single path string, consistent with
+            # how _graphrag_paths_from_response handles GraphRAG output.
+            generated_paths = [answer_text] if answer_text else []
+        except Exception as e:
+            print(f"  [rag] item {item['id']} failed: {e}")
+            generated_paths = []
+        elapsed = time.perf_counter() - t0
+
+        scores = score_single(generated_paths, item, graph, valid_edges)
+        results.append({
+            "method": "rag",
+            **scores,
+            "trie_build_s": 0.0,   # RAG has no trie
+            "generation_s": elapsed,
+            "total_s": elapsed,
+            "prompt_tokens": 0,    # retrieval token count not tracked here
+            "generated_paths": generated_paths,
+        })
+
+        if (i + 1) % 10 == 0:
+            print(f"  [rag] {i + 1}/{len(items)} done")
 
     return results
 
@@ -281,19 +356,31 @@ def beam_sweep(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="GCR-OCEL evaluation runner")
-    p.add_argument("--graph",      default="test2.graphml")
-    p.add_argument("--eval-local", default="eval_local.jsonl")
-    p.add_argument("--eval-obj",   default="eval_localobj.jsonl")
-    p.add_argument("--model",      default="Qwen/Qwen2.5-1.5B-Instruct")
-    p.add_argument("--device",     default="cpu")
-    p.add_argument("--num-paths",  type=int, default=3)
-    p.add_argument("--max-depth",  type=int, default=3)
-    p.add_argument("--out-dir",    default="results")
+    p.add_argument("--graph",       default="test2.graphml")
+    p.add_argument("--eval-local",  default="eval_local.jsonl")
+    p.add_argument("--eval-obj",    default="eval_localobj.jsonl")
+    p.add_argument("--model",       default="Qwen/Qwen2.5-1.5B-Instruct")
+    p.add_argument("--device",      default="cpu")
+    p.add_argument("--num-paths",   type=int, default=3)
+    p.add_argument("--max-depth",   type=int, default=3)
+    p.add_argument("--out-dir",     default="results")
+    # RAG-specific arguments
+    p.add_argument(
+        "--faiss-db",
+        default="./faiss_db_pm4py",
+        help="Path to the saved FAISS index used by the RAG baseline",
+    )
+    p.add_argument(
+        "--embedding",
+        default="bge",
+        choices=["openai", "bge", "minilm", "e5"],
+        help="Embedding backend to use for the RAG retriever",
+    )
     p.add_argument(
         "--methods",
         nargs="+",
-        default=["gcr", "unconstrained", "graphrag"],
-        choices=["gcr", "unconstrained", "graphrag"],
+        default=["gcr", "unconstrained", "graphrag", "rag"],
+        choices=["gcr", "unconstrained", "graphrag", "rag"],
         help="Which methods to run",
     )
     p.add_argument(
@@ -333,9 +420,27 @@ def main() -> None:
     # ------------------------------------------------------------------
     agent = None
     if "gcr" in args.methods or "unconstrained" in args.methods:
-        print(f"Loading model: {args.model}")
+        print(f"Loading GCR model: {args.model}")
         agent = _load_gcr_agent(args.model, G, device=args.device)
-        print("  Model ready.")
+        print("  GCR model ready.")
+
+    graphrag_llm = None
+    graphrag_search_fn = None
+    if "graphrag" in args.methods:
+        graphrag_search_fn, graphrag_llm = _load_graphrag(args.model)
+        print("  GraphRAG model ready.")
+
+    rag_chain = None
+    if "rag" in args.methods:
+        if not os.path.exists(args.faiss_db):
+            print(
+                f"WARNING: FAISS index not found at '{args.faiss_db}'. "
+                f"Build it first with get_retriever(...). Skipping RAG."
+            )
+        else:
+            print(f"Loading RAG chain (embedding={args.embedding}, llm={args.model}) ...")
+            rag_chain = _load_rag_chain(args.faiss_db, args.embedding, args.model)
+            print("  RAG chain ready.")
 
     # ------------------------------------------------------------------
     # Run evaluations
@@ -362,11 +467,17 @@ def main() -> None:
             all_results[ds_name].extend(res)
             save_results(res, os.path.join(args.out_dir, f"unconstrained_{ds_name}.jsonl"))
 
-        if "graphrag" in args.methods:
+        if "graphrag" in args.methods and graphrag_llm is not None:
             print("  Running GraphRAG baseline ...")
-            res = run_graphrag(items, G, valid_edges)
+            res = run_graphrag(items, G, valid_edges, graphrag_search_fn, graphrag_llm)
             all_results[ds_name].extend(res)
             save_results(res, os.path.join(args.out_dir, f"graphrag_{ds_name}.jsonl"))
+
+        if "rag" in args.methods and rag_chain is not None:
+            print("  Running RAG baseline ...")
+            res = run_rag(items, rag_chain, G, valid_edges)
+            all_results[ds_name].extend(res)
+            save_results(res, os.path.join(args.out_dir, f"rag_{ds_name}.jsonl"))
 
         print_summary(all_results[ds_name], ds_name)
 
