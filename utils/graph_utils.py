@@ -157,27 +157,6 @@ def build_vocabularies_from_local_graph(G):
 
     return activities, object_types, qualifiers
 
-# def ground_entities(G, entities):
-#     grounded = {
-#         "event_nodes": [],
-#         "object_nodes": []
-#     }
-
-#     for n, data in G.nodes(data=True):
-#         if n.startswith("event:"):
-#             if data.get("activity", "").lower() in entities["activities"]:
-#                 grounded["event_nodes"].append(n)
-
-#         else:  # object node
-#             if n in entities["object_instances"]:
-#                 grounded["object_nodes"].append(n)
-#             else:
-#                 obj_type = n.split(":")[0].lower()
-#                 if obj_type in entities["object_types"]:
-#                     grounded["object_nodes"].append(n)
-
-#     return grounded
-
 def resolve_anchor_nodes(G, ner):
     """
     Extract anchor nodes directly from the NER output.

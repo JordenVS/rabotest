@@ -1,6 +1,7 @@
 import pm4py
 import pandas as pd
 from llama_index.core import Document
+from langchain_core.documents import Document as LCDocument
 
 def get_docs_from_pm4py(input_file_path):
     print(f"Loading OCEL 2.0 log via pm4py: {input_file_path}...")
@@ -116,5 +117,17 @@ def get_docs_from_pm4py(input_file_path):
             doc_id=evt_id,
             metadata={"id": evt_id, "activity": activity, "entity_type": "Event"}
         ))
-
+    print(f"Created {len(rag_docs)} documents from OCEL log.")
     return rag_docs
+
+def to_langchain_docs(docs) -> list:
+    """Convert LlamaIndex or plain Documents to LangChain Documents."""
+    lc_docs = []
+    print(f"Converting {len(docs)} documents to LangChain format...")
+    for doc in docs:
+        # LlamaIndex Document has .text, LangChain has .page_content
+        text = getattr(doc, "page_content", None) or getattr(doc, "text", "")
+        metadata = getattr(doc, "metadata", {})
+        lc_docs.append(LCDocument(page_content=text, metadata=metadata))
+    print(f"Converted {len(docs)} documents to LangChain format.")
+    return lc_docs
