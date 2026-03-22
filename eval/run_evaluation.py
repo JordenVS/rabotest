@@ -85,7 +85,7 @@ def _load_graphrag(model_id: str):
 
 def _load_rag_chain(faiss_db: str, embedding_backend: str, llm_model: str):
     """Load FAISS index and build the RAG chain."""
-    from rag.p2prag import get_retriever_from_db, create_rag_chain
+    from rag.rag import get_retriever_from_db, create_rag_chain
     retriever = get_retriever_from_db(faiss_db, embedding_backend=embedding_backend)
     chain = create_rag_chain(
         retriever,

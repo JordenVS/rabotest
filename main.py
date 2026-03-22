@@ -1,21 +1,23 @@
 #from utils.download_files import download_json_from_zenodo
 from gcr.processors import GCRProcessAgent
-from utils.preprocess_pm4py import get_docs_from_pm4py
+from utils.preprocess_pm4py import get_docs_from_pm4py, to_langchain_docs
 from utils.graph_utils import ocel_to_graph_with_pm4py, load_graphml_to_networkx, build_vocabularies_from_local_graph
 from eval.generate_eval_dataset import build_all_datasets
-from rag.p2prag import get_retriever, create_rag_agent, get_retriever_from_db
+from rag.rag import get_retriever, get_retriever_from_db, create_rag_chain
 #from graphrag.graphrag import perform_local_search
 #from gcr.gcr import build_trie_from_path_strings, linearize_path, build_trie_from_ocel, extract_paths, collect_unique_path_strings
 from gcr.trie import ProcessTrie
+import pickle
+import os
 from dotenv import load_dotenv
 
 
 load_dotenv()
+DOCS_CACHE = "cache/pm4py_docs.pkl"
 
 if __name__ == "__main__":
     #RECORD_ID = "8412920"
     #download_json_from_zenodo(RECORD_ID, output_dir="./zenodo_json_data")
-    #docs = get_docs("zenodo_json_data/ocel2-p2p.json")
     #docs = get_docs_extensive("data/ocel2-p2p.json")
 
     # docs.sort(key=lambda d: d.metadata.get("id", ""))
@@ -24,8 +26,32 @@ if __name__ == "__main__":
     #      print(doc) 
     #      print("\n")
     # print("Creating retriever...")
-    # retriever = get_retriever(docs, "./faiss_db_ext")
-    # print("Retriever is ready.")
+    # li_docs = get_docs_from_pm4py("data/ocel2-p2p.json")
+    # docs = to_langchain_docs(li_docs)
+
+    if os.path.exists(DOCS_CACHE):
+        print("Loading docs from cache...")
+        with open(DOCS_CACHE, "rb") as f:
+            docs = pickle.load(f)
+    else:
+        print("Building docs from pm4py (slow)...")
+        li_docs = get_docs_from_pm4py("data/ocel2-p2p.json")
+        os.makedirs("cache", exist_ok=True)
+        docs = to_langchain_docs(li_docs)
+        with open(DOCS_CACHE, "wb") as f:
+            pickle.dump(docs, f)
+        print(f"Docs cached to {DOCS_CACHE}.")
+
+    # retriever_openai = get_retriever(docs, "./faiss_db_openai", embedding_backend="openai")
+    # print("OpenAI retriever is ready.")
+    retriever_minilm = get_retriever(docs, "./faiss_db_minilm", embedding_backend="minilm")
+    print("MiniLM retriever is ready.")
+    retriever_e5 = get_retriever(docs, "./faiss_db_e5", embedding_backend="e5")
+    print("E5 retriever is ready.")
+    retriever_bge = get_retriever(docs, "./faiss_db_bge", embedding_backend="bge")
+    print("BGE retriever is ready.")
+
+
 
     #docs = get_docs_from_pm4py("data/ocel2-p2p.json")
     #docs.sort(key=lambda d: d.metadata.get("id", ""))
@@ -104,14 +130,14 @@ if __name__ == "__main__":
 
     # print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 
-    graph = load_graphml_to_networkx("test2.graphml")
-    #build_all_datasets(graph, out_prefix="eval")
+    # graph = load_graphml_to_networkx("test2.graphml")
+    # #build_all_datasets(graph, out_prefix="eval")
         
-    agent = GCRProcessAgent("Qwen/Qwen2.5-1.5B-Instruct", graph)
-    results = agent.generate_compliant_paths("event:25958", "What happens after event event:25958? What objects are involved?")
-    print(results)
-    results = agent.generate_compliant_paths("goods receipt:383", "What are the events associated with object goods receipt:383? Describe its lifecycle.")
-    print(results)
+    # agent = GCRProcessAgent("Qwen/Qwen2.5-1.5B-Instruct", graph)
+    # results = agent.generate_compliant_paths("event:25958", "What happens after event event:25958? What objects are involved?")
+    # print(results)
+    # results = agent.generate_compliant_paths("goods receipt:383", "What are the events associated with object goods receipt:383? Describe its lifecycle.")
+    # print(results)
     #results = agent.generate_compliant_paths("event:3885", "What happens after event:3885? What objects are involved?")
     #results = agent.generate_compliant_paths("event:11991", "What happens after event:11991? What objects are involved?")
     #print(results)

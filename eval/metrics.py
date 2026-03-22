@@ -146,12 +146,12 @@ def _build_valid_semantic_edges(G: nx.DiGraph) -> Set[tuple]:
     Pre-compute the set of valid (src_label, rel, tgt_label) triples from G.
     Uses the same node_semantic_label scheme as the trie construction.
     """
-    from utils.generate_eval_dataset import node_semantic_label
+    from gcr.gcr import node_label
 
     valid = set()
     for u, v, data in G.edges(data=True):
         rel = data.get("label", "rel").replace(" ", "_")
-        valid.add((node_semantic_label(G, u), rel, node_semantic_label(G, v)))
+        valid.add((node_label(G, u), rel, node_label(G, v)))
     return valid
 
 

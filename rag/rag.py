@@ -1,5 +1,5 @@
 """
-p2prag.py — RAG pipeline for P2P OCEL process logs.
+rag.py — RAG pipeline for P2P OCEL process logs.
 
 Embedding backends supported:
   - "openai"       : OpenAI text-embedding-3-small  (requires OPENAI_API_KEY)
@@ -86,9 +86,9 @@ def _build_embeddings(backend: EmbeddingBackend):
 
     return HuggingFaceEmbeddings(
         model_name=cfg["model_name"],
-        encode_kwargs=cfg.get("encode_kwargs", {}),
+        encode_kwargs=cfg.get("encode_kwargs", {}), 
+        show_progress_bar=True,
     )
-
 
 # ---------------------------------------------------------------------------
 # Vectorstore helpers
