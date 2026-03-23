@@ -189,6 +189,7 @@ class GCRProcessAgent:
         seed_entity: str,
         question: str,
         num_paths: int = 3,
+        max_depth: int = 4,
         max_new_tokens: int = 100,
     ) -> List[str]:
         """
@@ -196,10 +197,18 @@ class GCRProcessAgent:
         Used as the baseline ('GCR w/o constraint') in the ablation study,
         directly mirroring Figure 5 of Luo et al. (2024).
         """
+        path_strings = collect_unique_path_strings(self.graph, [seed_entity], max_depth=max_depth)
+        context = "\n".join(path_strings[:5])  # cap to avoid context overflow
+
         prompt = (
+            f"You are a process mining assistant. Output ONLY a valid process path "
+            f"in the format: EntityType:Label REL_LABEL EntityType:Label REL_LABEL ...\n"
+            f"Do not explain. Do not number steps. Output the path only.\n\n"
+            f"The following are valid paths in the process graph starting from the seed entity:\n"
+            f"{context}\n\n"
             f"Question: {question}\n"
-            f"Context: Found Object {seed_entity}.\n"
-            f"Reasoning Path: "
+            f"Seed entity: {seed_entity}\n"
+            f"Reasoning Path: Event: or Object:"
         )
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
         prompt_len = inputs.input_ids.shape[1]
@@ -253,7 +262,7 @@ class GCRProcessAgent:
             )
         else:
             paths = self.generate_unconstrained_paths(
-                seed_entity, question, num_paths=num_paths
+                seed_entity, question, num_paths=num_paths, max_depth=max_depth
             )
         generation_s = time.perf_counter() - t1
 
