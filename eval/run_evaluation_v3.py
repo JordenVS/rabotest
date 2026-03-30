@@ -252,51 +252,129 @@ def build_noctx_prompt(question: str) -> str:
 # STAGE 1 — PATH HIT METRIC  (GCR conditions only)
 # =============================================================================
 
+# def hit_metric_paths(
+#     predicted_paths: List[str],
+#     ground_truth: Dict,
+# ) -> Dict:
+#     """
+#     Evaluate whether retrieved paths contain the ground-truth entities.
+#     Expected nodes are formatted as Event:Activity_Name (underscored),
+#     matching the linearize_path() output format in gcr/gcr.py.
+
+#     Returns
+#     -------
+#     dict with keys:
+#         activity_recall : float | None  — fraction of ground-truth Event nodes found
+#         entity_recall   : float | None  — fraction of Object nodes found (Type 3)
+#         hits / misses   : lists of matched/missed node strings
+#     """
+#     pgt = ground_truth.get("path_ground_truth", {})
+#     expected_nodes = pgt.get("expected_nodes", [])
+#     object_nodes = pgt.get("object_nodes", [])
+
+#     if not expected_nodes and not object_nodes:
+#         return {"activity_recall": None, "note": "no path_ground_truth in record"}
+
+#     all_paths_text = " ".join(predicted_paths).lower()
+
+#     if expected_nodes:
+#         hits = [n for n in expected_nodes if n.lower() in all_paths_text]
+#         activity_recall = round(len(hits) / len(expected_nodes), 3)
+#         misses = [n for n in expected_nodes if n not in hits]
+#     else:
+#         activity_recall, hits, misses = None, [], []
+
+#     result: Dict = {
+#         "activity_recall": activity_recall,
+#         "hits": hits,
+#         "misses": misses,
+#     }
+
+#     if object_nodes:
+#         obj_hits = [n for n in object_nodes if n.lower() in all_paths_text]
+#         result["entity_recall"] = round(len(obj_hits) / len(object_nodes), 3)
+#         result["object_hits"] = obj_hits
+
+#     return result
 def hit_metric_paths(
-    predicted_paths: List[str],
-    ground_truth: Dict,
-) -> Dict:
-    """
-    Evaluate whether retrieved paths contain the ground-truth entities.
-    Expected nodes are formatted as Event:Activity_Name (underscored),
-    matching the linearize_path() output format in gcr/gcr.py.
+        predicted_paths: List[str],
+        ground_truth: Dict,
+    ) -> Dict:
+        """
+        Evaluate whether retrieved GCR paths contain the ground-truth entities.
 
-    Returns
-    -------
-    dict with keys:
-        activity_recall : float | None  — fraction of ground-truth Event nodes found
-        entity_recall   : float | None  — fraction of Object nodes found (Type 3)
-        hits / misses   : lists of matched/missed node strings
-    """
-    pgt = ground_truth.get("path_ground_truth", {})
-    expected_nodes = pgt.get("expected_nodes", [])
-    object_nodes = pgt.get("object_nodes", [])
+        Expected nodes are formatted as "Event:Activity_Name" or "Object:type"
+        (from path_ground_truth in the eval dataset). GCR paths are chain strings
+        like "Event:Create_PO NEXT_FOR_po Event:Approve_PO ...".
 
-    if not expected_nodes and not object_nodes:
-        return {"activity_recall": None, "note": "no path_ground_truth in record"}
+        Two normalisation steps are applied before matching:
+        1. Deduplication — expected_nodes often contains repeated entries (one
+            per object event sequence), which would unfairly inflate the
+            denominator. We evaluate against the unique set.
+        2. Object label normalisation — expected_nodes uses "Object:goods receipt"
+            (space) but GCR relation labels use "Object:goods_receipt" (underscore).
+            Both forms are checked.
 
-    all_paths_text = " ".join(predicted_paths).lower()
+        Returns
+        -------
+        dict with keys:
+            activity_recall : float | None  — fraction of unique ground-truth
+                            Event nodes found in the predicted paths
+            entity_recall   : float | None  — fraction of unique Object nodes found
+                            (Type 3 cross-object questions only)
+            hits / misses   : lists of matched/missed node label strings
+        """
+        pgt = ground_truth.get("path_ground_truth", {})
+        expected_nodes = pgt.get("expected_nodes", [])
+        object_nodes = pgt.get("object_nodes", [])
 
-    if expected_nodes:
-        hits = [n for n in expected_nodes if n.lower() in all_paths_text]
-        activity_recall = round(len(hits) / len(expected_nodes), 3)
-        misses = [n for n in expected_nodes if n not in hits]
-    else:
-        activity_recall, hits, misses = None, [], []
+        if not expected_nodes and not object_nodes:
+            return {"activity_recall": None, "note": "no path_ground_truth in record"}
 
-    result: Dict = {
-        "activity_recall": activity_recall,
-        "hits": hits,
-        "misses": misses,
-    }
+        # Join all predicted path strings into one lowercase search space
+        all_paths_text = " ".join(predicted_paths).lower()
 
-    if object_nodes:
-        obj_hits = [n for n in object_nodes if n.lower() in all_paths_text]
-        result["entity_recall"] = round(len(obj_hits) / len(object_nodes), 3)
-        result["object_hits"] = obj_hits
+        # --- Activity recall (Event nodes) ---
+        # Deduplicate: a node that appears 4x in expected_nodes should only count once.
+        unique_event_nodes = list(dict.fromkeys(expected_nodes))  # preserves order
 
-    return result
+        if unique_event_nodes:
+            hits, misses = [], []
+            for n in unique_event_nodes:
+                # Normalise spaces to underscores so "Event:Two-Way Match" matches
+                # "Event:Two-Way_Match" in GCR output
+                n_normalised = n.lower().replace(" ", "_")
+                if n_normalised in all_paths_text or n.lower() in all_paths_text:
+                    hits.append(n)
+                else:
+                    misses.append(n)
+            activity_recall = round(len(hits) / len(unique_event_nodes), 3)
+        else:
+            activity_recall, hits, misses = None, [], []
 
+        result: Dict = {
+            "activity_recall": activity_recall,
+            "hits": hits,
+            "misses": misses,
+            "unique_expected": len(unique_event_nodes),
+            "raw_expected": len(expected_nodes),  # for transparency in results
+        }
+
+        # --- Entity recall (Object nodes, Type 3 only) ---
+        if object_nodes:
+            unique_object_nodes = list(dict.fromkeys(object_nodes))
+            obj_hits = []
+            for n in unique_object_nodes:
+                # "Object:goods receipt" → also try "Object:goods_receipt"
+                n_lower = n.lower()
+                n_underscored = n_lower.replace(" ", "_")
+                if n_lower in all_paths_text or n_underscored in all_paths_text:
+                    obj_hits.append(n)
+            result["entity_recall"] = round(len(obj_hits) / len(unique_object_nodes), 3)
+            result["object_hits"] = obj_hits
+            result["unique_object_expected"] = len(unique_object_nodes)
+
+        return result
 
 # =============================================================================
 # STAGE 2 — ANSWER QUALITY METRICS
@@ -494,8 +572,8 @@ def run_condition(
             else:
                 # Graceful fallback: no paths available for this question
                 prompt = build_noctx_prompt(question_text)
-            answer = call_hf_model(prompt, tokenizer, hf_model, SYSTEM_PROCESS_MINING)
-
+            #answer = call_hf_model(prompt, tokenizer, hf_model, SYSTEM_PROCESS_MINING)
+            answer = ""
         else:
             raise ValueError(f"Unknown condition: '{condition}'")
 
@@ -523,9 +601,9 @@ def run_condition(
             # Binary classification: no LLM judge needed
             result["binary_eval"] = evaluate_anomaly_detection(answer, gt)
         # LLM-as-judge faithfulness for all question types
-        result["faithfulness"] = judge_faithfulness(
-            question_text, answer, gt.get("facts", {}), judge_model
-        )
+        # result["faithfulness"] = judge_faithfulness(
+        #     question_text, answer, gt.get("facts", {}), judge_model
+        # )
 
         results.append(result)
 

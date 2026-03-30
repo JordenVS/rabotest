@@ -41,7 +41,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from tqdm import tqdm
 
@@ -54,7 +54,8 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from utils.graph_utils import load_graphml_to_networkx
-from gcr.processors import GCRProcessAgent
+#from gcr.processors import GCRProcessAgent
+from gcr.processors2 import GCRProcessAgent, DualGCRProcessAgent
 
 
 # ---------------------------------------------------------------------------
@@ -81,10 +82,11 @@ def save_jsonl(records: List[Dict], path: str) -> None:
 def generate_paths(
     questions: List[Dict],
     agent: GCRProcessAgent,
+    dualagent: DualGCRProcessAgent,
     constrained: bool,
     num_paths: int,
     max_depth: int,
-) -> List[Dict]:
+) -> Tuple[List[Dict], List[Dict]]:
     """
     Run the agent over all questions and return a list of
     {"id": ..., "paths": [...], "trie_build_s": ..., "generation_s": ...} records.
@@ -94,14 +96,15 @@ def generate_paths(
     are skipped and recorded with an empty path list.
     """
     mode = "constrained" if constrained else "unconstrained"
-    records: List[Dict] = []
+    records_local: List[Dict] = []
+    records_global: List[Dict] = []
 
     for q in tqdm(questions, desc=f"Generating {mode} paths"):
         topic_entities = q.get("topic_entities", [])
         seed_entity = topic_entities[0] if topic_entities else None
 
         if seed_entity is None or seed_entity not in agent.graph:
-            records.append({
+            records_local.append({
                 "id": q["id"],
                 "paths": [],
                 "trie_build_s": 0.0,
@@ -120,14 +123,14 @@ def generate_paths(
                 num_paths=num_paths,
                 max_depth=max_depth,
             )
-            records.append({
+            records_local.append({
                 "id": q["id"],
                 "paths": timing.pop("paths"),
                 **timing,
             })
         except Exception as e:
             print(f"\n  [WARNING] {q['id']} ({seed_entity}) failed: {e}")
-            records.append({
+            records_local.append({
                 "id": q["id"],
                 "paths": [],
                 "trie_build_s": 0.0,
@@ -137,7 +140,35 @@ def generate_paths(
                 "note": f"error: {e}",
             })
 
-    return records
+        try:
+            timing = dualagent.timed_generate(
+                seed_entity=seed_entity,
+                question=q["question"],
+                constrained=constrained,
+                num_paths=num_paths,
+                max_depth=max_depth,
+            )
+            records_global.append({
+                "id": q["id"],
+                "local_paths": timing.pop("local_paths"),
+                "global_paths": timing.pop("global_paths"),
+                **timing,
+            })
+        except Exception as e:
+            print(f"\n  [WARNING] {q['id']} ({seed_entity}) failed: {e}")
+            records_global.append({
+                "id": q["id"],
+                "local_paths": [],
+                "global_paths": [],
+                "trie_build_s": 0.0,
+                "generation_s": 0.0,
+                "total_s": 0.0,
+                "prompt_tokens": 0,
+                "note": f"error: {e}",
+            })
+
+
+    return records_local, records_global
 
 
 # ---------------------------------------------------------------------------
@@ -205,9 +236,11 @@ def main() -> None:
     print(f"Loading path-generation model: {args.model}")
     agent = GCRProcessAgent(args.model, G, device=args.device)
     print("  Agent ready.\n")
+    dual_agent = DualGCRProcessAgent(args.model, G_local=G, G_global=None, device=args.device)
+    print("  Dual Agent ready.\n")
 
-    # --- Constrained ---
-    print("--- Generating CONSTRAINED paths ---")
+    #--- Constrained ---
+    print("--- Generating CONSTRAINED paths local agent ---")
     constrained_records = generate_paths(
         questions, agent,
         constrained=True,
@@ -216,7 +249,7 @@ def main() -> None:
     )
     save_jsonl(
         constrained_records,
-        os.path.join(args.out_dir, "predicted_paths_constrained.jsonl"),
+        os.path.join(args.out_dir, "predicted_paths_constrained_local.jsonl"),
     )
 
     # --- Unconstrained ---
