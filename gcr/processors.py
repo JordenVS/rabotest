@@ -37,12 +37,19 @@ class GCRProcessProcessor(torch.nn.Module):
         The same tokenizer used to build the trie and encode the prompt.
     """
 
-    def __init__(self, trie, prompt_lens: List[int], tokenizer):
+    def __init__(self, trie, prompt_lens: List[int], tokenizer, edge_boost: float = 2.0):
         super().__init__()
         self.trie = trie
         self.prompt_lens = prompt_lens
         self.tokenizer = tokenizer
         self.eos_token_id = tokenizer.eos_token_id
+        # correct
+        self.next_for_token_ids = {
+            tid for tok, tid in tokenizer.get_vocab().items()
+            if "NEXT_FOR" in tok
+        }
+        self.edge_boost = edge_boost
+
 
     def __call__(
         self,
@@ -52,17 +59,12 @@ class GCRProcessProcessor(torch.nn.Module):
 
         batch_size = input_ids.shape[0]
         num_prompts = len(self.prompt_lens)
-
-        # beam_width: how many beams per original prompt
-        # Guard: if batch_size < num_prompts something is very wrong,
-        #        but at least avoid ZeroDivisionError.
         beam_width = max(1, batch_size // num_prompts)
 
         for b in range(batch_size):
             prompt_idx = min(b // beam_width, num_prompts - 1)
             p_len = self.prompt_lens[prompt_idx]
 
-            # Tokens generated so far for this beam (excluding the prompt)
             current_gen_ids = input_ids[b][p_len:].tolist()
             allowed = self.trie.allowed_next(current_gen_ids)
 
@@ -72,14 +74,27 @@ class GCRProcessProcessor(torch.nn.Module):
                 allowed_tensor = torch.tensor(
                     list(allowed), dtype=torch.long, device=scores.device
                 )
-                # Clamp to actual vocab size (safety guard)
                 vocab_size = scores.shape[-1]
                 allowed_tensor = allowed_tensor[
                     (allowed_tensor >= 0) & (allowed_tensor < vocab_size)
                 ]
+                # 1. copy original scores for all allowed tokens
                 mask[allowed_tensor] = scores[b, allowed_tensor]
+
+                # 2. boost NEXT_FOR tokens on top of their original scores
+                if self.edge_boost != 0.0:
+                    boost_candidates = allowed_tensor[
+                        torch.isin(
+                            allowed_tensor,
+                            torch.tensor(
+                                list(self.next_for_token_ids),
+                                dtype=torch.long,
+                                device=scores.device,
+                            )
+                        )
+                    ]
+                    mask[boost_candidates] += self.edge_boost
             else:
-                # Trie exhausted — allow EOS so generation terminates cleanly
                 mask[self.eos_token_id] = scores[b, self.eos_token_id]
 
             scores[b] = mask

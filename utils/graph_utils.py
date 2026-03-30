@@ -1,7 +1,8 @@
 import networkx as nx
 import pandas as pd
 import pm4py
-from collections import deque
+import pickle
+from collections import deque, defaultdict
 from typing import List, Dict, Any, Set
 
 
@@ -134,6 +135,99 @@ def ocel_to_graph_with_pm4py(input_file_path, output_file_path) -> nx.DiGraph:
     print(f"Exporting to {output_file_path}...")
     nx.write_graphml(G, output_file_path)
     print("Success! Import this file into Gephi.")
+    return G
+
+def build_global_context_from_ocel(
+    input_file_path: str,
+    min_edge_frequency: int = 5,
+    output_file_path: str = None
+) -> nx.DiGraph:
+    """
+    Convert a pm4py OC-DFG discovery result into a NetworkX DiGraph
+    representing the population-level process structure.
+
+    Node format : "activity:<Activity_With_Underscores>"
+    Edge format : label="DFG_FOLLOWS", frequency=<int>,
+                  per_type_freq=<dict>, object_types=<list>
+    """
+    print(f"Loading OCEL 2.0 log via pm4py: {input_file_path}...")
+    ocel = pm4py.read_ocel2(input_file_path)
+    ocdfg = pm4py.discover_ocdfg(ocel)
+
+    G = nx.DiGraph()
+
+    # --- 1. Activity nodes ---
+    # activities is a plain set of strings
+    for act in ocdfg["activities"]:
+        node_id = f"activity:{act.replace(' ', '_')}"
+        G.add_node(
+            node_id,
+            entity_type="Activity",
+            activity=act,
+        )
+
+    # Mark start/end activities as node attributes
+    # start_activities: {object_type: {activity: count}}
+    for obj_type, acts in ocdfg.get("start_activities", {}).items():
+        for act in acts:
+            node_id = f"activity:{act.replace(' ', '_')}"
+            if node_id in G:
+                G.nodes[node_id]["is_start"] = True
+
+    for obj_type, acts in ocdfg.get("end_activities", {}).items():
+        for act in acts:
+            node_id = f"activity:{act.replace(' ', '_')}"
+            if node_id in G:
+                G.nodes[node_id]["is_end"] = True
+
+    # --- 2. DFG edges ---
+    # edges: {object_type: {(act_a, act_b): count}}
+    # Aggregate counts and track which object types use each edge
+    edge_totals: dict = defaultdict(int)
+    edge_per_type: dict = defaultdict(dict)
+
+    # for obj_type, arc_dict in ocdfg.get("edges", {}).items():
+    #     for (src_act, tgt_act), count in arc_dict.items():
+    #         key = (src_act, tgt_act)
+    #         edge_totals[key] += count
+    #         edge_per_type[key][obj_type] = count
+    for obj_type_outer, outer_dict in ocdfg.get("edges", {}).items():
+        for obj_type_inner, arc_dict in outer_dict.items():
+            for (src_act, tgt_act), event_pairs in arc_dict.items():
+                key = (src_act, tgt_act)
+                edge_totals[key] += len(event_pairs)
+                edge_per_type[key][obj_type_inner] = edge_per_type[key].get(obj_type_inner, 0) + len(event_pairs)
+
+    for (src_act, tgt_act), total_freq in edge_totals.items():
+        if total_freq < min_edge_frequency:
+            continue
+
+        src_id = f"activity:{src_act.replace(' ', '_')}"
+        tgt_id = f"activity:{tgt_act.replace(' ', '_')}"
+
+        # Guard: both nodes must exist (should always be true but be safe)
+        if src_id not in G or tgt_id not in G:
+            continue
+
+        G.add_edge(
+            src_id, tgt_id,
+            label="DFG_FOLLOWS",
+            frequency=total_freq,
+            per_type_freq=dict(edge_per_type[(src_act, tgt_act)]),
+            object_types=list(edge_per_type[(src_act, tgt_act)].keys()),
+        )
+        
+
+    if output_file_path:
+        with open(output_file_path, "wb") as f:
+            pickle.dump(G, f)
+            print(f"Graph successfully pickled to: {output_file_path}")
+
+    print(
+        f"[Global graph] {G.number_of_nodes()} activity nodes, "
+        f"{G.number_of_edges()} DFG edges "
+        f"(min_freq={min_edge_frequency})."
+    )
     return G
 
 def load_graphml_to_networkx(graphml_file_path) -> nx.DiGraph:

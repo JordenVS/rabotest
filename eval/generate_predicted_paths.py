@@ -38,6 +38,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import pickle
 import json
 import os
 import sys
@@ -140,32 +141,32 @@ def generate_paths(
                 "note": f"error: {e}",
             })
 
-        try:
-            timing = dualagent.timed_generate(
-                seed_entity=seed_entity,
-                question=q["question"],
-                constrained=constrained,
-                num_paths=num_paths,
-                max_depth=max_depth,
-            )
-            records_global.append({
-                "id": q["id"],
-                "local_paths": timing.pop("local_paths"),
-                "global_paths": timing.pop("global_paths"),
-                **timing,
-            })
-        except Exception as e:
-            print(f"\n  [WARNING] {q['id']} ({seed_entity}) failed: {e}")
-            records_global.append({
-                "id": q["id"],
-                "local_paths": [],
-                "global_paths": [],
-                "trie_build_s": 0.0,
-                "generation_s": 0.0,
-                "total_s": 0.0,
-                "prompt_tokens": 0,
-                "note": f"error: {e}",
-            })
+        if constrained:
+            try:
+                timing = dualagent.timed_generate(
+                    seed_entity=seed_entity,
+                    question=q["question"],
+                    num_paths=num_paths,
+                    max_depth=max_depth,
+                )
+                records_global.append({
+                    "id": q["id"],
+                    "local_paths": timing.pop("local_paths"),
+                    "global_paths": timing.pop("global_paths"),
+                    **timing,
+                })
+            except Exception as e:
+                print(f"\n  [WARNING] {q['id']} ({seed_entity}) failed: {e}")
+                records_global.append({
+                    "id": q["id"],
+                    "local_paths": [],
+                    "global_paths": [],
+                    "trie_build_s": 0.0,
+                    "generation_s": 0.0,
+                    "total_s": 0.0,
+                    "prompt_tokens": 0,
+                    "note": f"error: {e}",
+                })
 
 
     return records_local, records_global
@@ -184,8 +185,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to the combined evaluation JSONL (e.g. eval/data/eval_combined.jsonl)"
     )
     p.add_argument(
-        "--graphml", required=True,
+        "--graph_local", required=True,
         help="Path to the OCEL process graph (e.g. test2.graphml)"
+    )
+    p.add_argument(
+        "--graph_global",
+        help="Path to the pickled graph (e.g. global_graph.pkl)"
     )
     p.add_argument(
         "--model", default="Qwen/Qwen2.5-1.5B-Instruct",
@@ -222,9 +227,13 @@ def main() -> None:
     args = parse_args()
 
     # Load graph
-    print(f"Loading graph: {args.graphml}")
-    G = load_graphml_to_networkx(args.graphml)
-    print(f"  {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    print(f"Loading graph: {args.graph_local}")
+    G_local = load_graphml_to_networkx(args.graph_local)
+
+    if args.graph_global:
+        print(f"Loading graph: {args.graph_global}")
+        with open(args.graph_global, "rb") as f:
+            G_global = pickle.load(f)
 
     # Load dataset
     questions = load_jsonl(args.dataset)
@@ -234,36 +243,40 @@ def main() -> None:
 
     # Load agent once — shared for both runs
     print(f"Loading path-generation model: {args.model}")
-    agent = GCRProcessAgent(args.model, G, device=args.device)
+    agent = GCRProcessAgent(args.model, G_local, device=args.device)
     print("  Agent ready.\n")
-    dual_agent = DualGCRProcessAgent(args.model, G_local=G, G_global=None, device=args.device)
+    dual_agent = DualGCRProcessAgent(args.model, G_local=G_local, G_global=G_global, device=args.device)
     print("  Dual Agent ready.\n")
 
     #--- Constrained ---
-    print("--- Generating CONSTRAINED paths local agent ---")
-    constrained_records = generate_paths(
-        questions, agent,
+    print("--- Generating CONSTRAINED paths local ---")
+    constrained_records_local, constrained_records_global= generate_paths(
+        questions, agent, dual_agent,
         constrained=True,
         num_paths=args.num_paths,
         max_depth=args.max_depth,
     )
     save_jsonl(
-        constrained_records,
+        constrained_records_local,
         os.path.join(args.out_dir, "predicted_paths_constrained_local.jsonl"),
+    )
+    save_jsonl(
+        constrained_records_global,
+        os.path.join(args.out_dir, "predicted_paths_constrained_global.jsonl"),
     )
 
     # --- Unconstrained ---
     if not args.skip_unconstrained:
         print("\n--- Generating UNCONSTRAINED paths ---")
-        unconstrained_records = generate_paths(
-            questions, agent,
+        unconstrained_records_local, unconstrained_records_global = generate_paths(
+            questions, agent, dual_agent,
             constrained=False,
             num_paths=args.num_paths,
             max_depth=args.max_depth,
         )
         save_jsonl(
-            unconstrained_records,
-            os.path.join(args.out_dir, "predicted_paths_unconstrained.jsonl"),
+            unconstrained_records_local,
+            os.path.join(args.out_dir, "predicted_paths_unconstrained_local.jsonl"),
         )
 
     print("\nDone. Pass the output files to run_evaluation.py:")
