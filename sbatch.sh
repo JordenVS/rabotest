@@ -26,7 +26,7 @@ echo ""
 
 set -euo pipefail 
 
-export APPTAINER_PATH=/tudelft.net/staff-umbrella/REITcourses/apptainer/llm_on_pytorch2.3.1-cuda12.1-cudnn8-runtime.sif
+export APPTAINER_PATH=/tudelft.net/staff-umbrella/REITcourses/apptainer/tudelft.net/staff-umbrella/reit/apptainer/pytorch2.2.1-cuda12.1.sif
 
 # Check that container file exists
 if [ ! -f ${APPTAINER_PATH} ]; then
