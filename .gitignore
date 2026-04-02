@@ -10,3 +10,5 @@ cache/
 .python-version
 claude/
 *.pkl
+test.*
+results*/
