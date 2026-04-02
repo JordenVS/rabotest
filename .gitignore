@@ -9,3 +9,6 @@ cache/
 .DS_Store
 .python-version
 claude/
+*.pkl
+test.*
+results*/
