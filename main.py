@@ -33,9 +33,8 @@ if __name__ == "__main__":
             docs = pickle.load(f)
     else:
         print("Building docs from pm4py (slow)...")
-        li_docs = get_docs_from_pm4py("data/ocel2-p2p.json")
+        docs = get_docs_from_pm4py("data/ocel2-p2p.json")
         os.makedirs("cache", exist_ok=True)
-        docs = to_langchain_docs(li_docs)
         with open(DOCS_CACHE, "wb") as f:
             pickle.dump(docs, f)
         print(f"Docs cached to {DOCS_CACHE}.")
@@ -76,8 +75,8 @@ if __name__ == "__main__":
     # query_engine = create_query_engine(kg_index, storage_context)
     # response = query_engine.query("What is a normal process in the procure to pay system?")
     # print(response)
-    local_graph = ocel_to_graph_with_pm4py("data/ocel2-p2p.json", "local_graph.graphml")
-    global_graph = build_global_context_from_ocel(input_file_path="data/ocel2-p2p.json", output_file_path="global_graph.pkl")
+    #local_graph = ocel_to_graph_with_pm4py("data/ocel2-p2p.json", "local_graph.graphml")
+    #global_graph = build_global_context_from_ocel(input_file_path="data/ocel2-p2p.json", output_file_path="global_graph.pkl")
     #graph = load_graphml_to_networkx("global_graph.graphml")
     # #activities, object_types, qualifiers = build_vocabularies_from_local_graph(graph)
     # paths = extract_paths(graph, "event:14389", max_depth=2) 

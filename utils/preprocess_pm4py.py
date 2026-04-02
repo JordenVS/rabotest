@@ -1,6 +1,6 @@
 import pm4py
 import pandas as pd
-from llama_index.core import Document
+#from llama_index.core import Document
 from langchain_core.documents import Document as LCDocument
 
 def get_docs_from_pm4py(input_file_path):
@@ -81,11 +81,16 @@ def get_docs_from_pm4py(input_file_path):
 
         page_content = f"{header}\n{attr_str}\n{link_str}\n\n" + "\n".join(nl)
 
-        rag_docs.append(Document(
-            text=page_content,
-            doc_id=obj_id,
-            metadata={"id": obj_id, "type": obj_type, "entity_type": "Object"}
-        ))
+        # rag_docs.append(Document(
+        #     text=page_content,
+        #     doc_id=obj_id,
+        #     metadata={"id": obj_id, "type": obj_type, "entity_type": "Object"}
+        # ))
+
+        rag_docs.append(LCDocument(
+        page_content=page_content,
+        metadata={"id": obj_id, "type": obj_type, "entity_type": "Object"}
+))
 
     for row in events_df.to_dict("records"):
         evt_id = row["ocel_eid"]
@@ -144,11 +149,16 @@ def get_docs_from_pm4py(input_file_path):
 
         page_content = f"{header}\n{attr_str}\n{link_str}\n\n" + "\n".join(nl)
 
-        rag_docs.append(Document(
-            text=page_content,
-            doc_id=evt_id,
-            metadata={"id": evt_id, "activity": activity, "entity_type": "Event"}
-        ))
+        # rag_docs.append(Document(
+        #     text=page_content,
+        #     doc_id=evt_id,
+        #     metadata={"id": evt_id, "activity": activity, "entity_type": "Event"}
+        # ))
+
+        rag_docs.append(LCDocument(
+    page_content=page_content,
+    metadata={"id": evt_id, "activity": activity, "entity_type": "Event"}
+))
 
     print(f"Created {len(rag_docs)} documents from OCEL log.")
     return rag_docs

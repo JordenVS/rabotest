@@ -10,7 +10,6 @@ dependencies = [
     "langchain-community>=0.4.1",
     "langchain-core>=1.2.24",
     "langchain-huggingface>=1.2.1",
-    "llama-index>=0.14.19",
     "networkx>=3.6.1",
     "pandas>=3.0.2",
     "pm4py>=2.7.22",

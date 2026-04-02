@@ -29,9 +29,11 @@ set -euo pipefail
 
 HF_Model_Path="sentence-transformers/all-MiniLM-L6-v2"
 
+module use /opt/insy/modulefiles
 module load python
+module load devtoolset/11
 cd $HOME/rabotest
-source .venv/bin/activate
+source .venv/Scripts/activate
 uv sync
 
 # Set HF home & cache dir
