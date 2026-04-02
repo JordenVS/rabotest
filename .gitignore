@@ -4,7 +4,6 @@ __pycache__/
 __init__.py
 *.graphml
 faiss_db*/
-cache/
 .DS_Store
 .python-version
 claude/

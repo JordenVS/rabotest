@@ -27,36 +27,39 @@ echo ""
 
 set -euo pipefail 
 
-export APPTAINER_PATH=/tudelft.net/staff-umbrella/REITcourses/apptainer/llm_on_pytorch2.3.1-cuda12.1-cudnn8-runtime.sif
-
-# Check that container file exists
-if [ ! -f ${APPTAINER_PATH} ]; then
-    ls ${APPTAINER_PATH}
-    exit 1
-else
-    echo "Using apptainer: ${APPTAINER_PATH}"
-fi 
+HF_Model_Path="sentence-transformers/all-MiniLM-L6-v2"
 
 module use /opt/insy/modulefiles
 module load python
 module load devtoolset/11
-
-APPTAINER_CWD=$HOME/rabotest/apptainer_workdir
-mkdir -p $APPTAINER_CWD
+cd $HOME/rabotest
+source .venv/Scripts/activate
+uv sync
 
 # Set HF home & cache dir
 export HF_HOME="hf_cache"
 export HF_HUB_CACHE="$HF_HOME"
 echo "HF_HUB_CACHE set to: $HF_HUB_CACHE"
 
-srun apptainer run --nv \
-  --env HF_HOME=FIXME \
-  ${APPTAINER_PATH} \
-  hf_excercise.py
+# Download HF model
+export HF_HUB_ENABLE_HF_TRANSFER=1
 
-cd $HOME/rabotest
+huggingface-cli download $HF_Model_Path \
+    --local-dir "$HF_HUB_CACHE/$(basename $HF_Model_Path)" \
+    --local-dir-use-symlinks False
 
+# Environment variables for enabling containers:
+#export APPTAINER_PATH=/tudelft.net/staff-umbrella/REITcourses/apptainer/pytorch2.2.1-cuda12.1.sif
+export APPTAINER_PATH=/tudelft.net/staff-umbrella/REITcourses/apptainer/llm_on_pytorch2.3.1-cuda12.1-cudnn8-runtime.sif
 
-python main.py    
+# Check that container file exists
+if [ ! -f $APPTAINER_PATH ]; then
+    ls $APPTAINER_PATH
+    exit 1
+fi
 
-rm -r /tmp/$USER/
+echo "Running GPU ML example with PyTorch..."
+echo "Container: $APPTAINER_PATH"
+echo ""    
+
+apptainer exec --nv $APPTAINER_PATH python3 gpu_ml_example.py
