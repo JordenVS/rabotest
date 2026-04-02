@@ -6,7 +6,6 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=1G
 #SBATCH --time=00:05:00
-#SBATCH --account=ewi-insy-reit
 #SBATCH --partition=general
 #SBATCH --qos=short
 
