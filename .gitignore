@@ -7,7 +7,6 @@ faiss_db*/
 .DS_Store
 .python-version
 claude/
-*.pkl
 test.*
 results*/
-eval/data/
+eval/data
