@@ -3,7 +3,6 @@
 __pycache__/
 __init__.py
 *.graphml
-data/
 faiss_db*/
 cache/
 .DS_Store
@@ -12,3 +11,4 @@ claude/
 *.pkl
 test.*
 results*/
+eval/data/

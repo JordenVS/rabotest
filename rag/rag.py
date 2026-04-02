@@ -86,8 +86,7 @@ def _build_embeddings(backend: EmbeddingBackend):
 
     return HuggingFaceEmbeddings(
         model_name=cfg["model_name"],
-        encode_kwargs=cfg.get("encode_kwargs", {}), 
-        show_progress_bar=True,
+        encode_kwargs=cfg.get("encode_kwargs", {})
     )
 
 # ---------------------------------------------------------------------------

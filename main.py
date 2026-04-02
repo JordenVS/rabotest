@@ -4,8 +4,8 @@ from utils.preprocess_pm4py import get_docs_from_pm4py, to_langchain_docs
 from utils.graph_utils import ocel_to_graph_with_pm4py, load_graphml_to_networkx, build_vocabularies_from_local_graph, build_global_context_from_ocel
 from eval.generate_eval_dataset import build_all_datasets
 from rag.rag import get_retriever, get_retriever_from_db, create_rag_chain
-#from graphrag.graphrag import perform_local_search
-#from gcr.gcr import build_trie_from_path_strings, linearize_path, build_trie_from_ocel, extract_paths, collect_unique_path_strings
+from graphrag.graphrag import perform_local_search
+from gcr.gcr import build_trie_from_path_strings, linearize_path, build_trie_from_ocel, extract_paths, collect_unique_path_strings
 from gcr.trie import ProcessTrie
 import pickle
 import os
@@ -26,26 +26,24 @@ if __name__ == "__main__":
     #      print(doc) 
     #      print("\n")
     # print("Creating retriever...")
-    # li_docs = get_docs_from_pm4py("data/ocel2-p2p.json")
-    # docs = to_langchain_docs(li_docs)
 
-    # if os.path.exists(DOCS_CACHE):
-    #     print("Loading docs from cache...")
-    #     with open(DOCS_CACHE, "rb") as f:
-    #         docs = pickle.load(f)
-    # else:
-    #     print("Building docs from pm4py (slow)...")
-    #     li_docs = get_docs_from_pm4py("data/ocel2-p2p.json")
-    #     os.makedirs("cache", exist_ok=True)
-    #     docs = to_langchain_docs(li_docs)
-    #     with open(DOCS_CACHE, "wb") as f:
-    #         pickle.dump(docs, f)
-    #     print(f"Docs cached to {DOCS_CACHE}.")
+    if os.path.exists(DOCS_CACHE):
+        print("Loading docs from cache...")
+        with open(DOCS_CACHE, "rb") as f:
+            docs = pickle.load(f)
+    else:
+        print("Building docs from pm4py (slow)...")
+        li_docs = get_docs_from_pm4py("data/ocel2-p2p.json")
+        os.makedirs("cache", exist_ok=True)
+        docs = to_langchain_docs(li_docs)
+        with open(DOCS_CACHE, "wb") as f:
+            pickle.dump(docs, f)
+        print(f"Docs cached to {DOCS_CACHE}.")
 
     # retriever_openai = get_retriever(docs, "./faiss_db_openai", embedding_backend="openai")
     # print("OpenAI retriever is ready.")
-    # retriever_minilm = get_retriever(docs, "./faiss_db_minilm", embedding_backend="minilm")
-    # print("MiniLM retriever is ready.")
+    retriever_minilm = get_retriever(docs, "./faiss_db_minilm", embedding_backend="minilm")
+    print("MiniLM retriever is ready.")
     # retriever_e5 = get_retriever(docs, "./faiss_db_e5", embedding_backend="e5")
     # print("E5 retriever is ready.")
     # retriever_bge = get_retriever(docs, "./faiss_db_bge", embedding_backend="bge")
@@ -79,7 +77,7 @@ if __name__ == "__main__":
     # response = query_engine.query("What is a normal process in the procure to pay system?")
     # print(response)
     # graph = ocel_to_graph_with_pm4py("data/ocel2-p2p.json", "global_graph.graphml")
-    graph = build_global_context_from_ocel(input_file_path="data/ocel2-p2p.json", output_file_path="graph_global.pkl")
+    #graph = build_global_context_from_ocel(input_file_path="data/ocel2-p2p.json", output_file_path="global_graph.pkl")
     #graph = load_graphml_to_networkx("global_graph.graphml")
     # #activities, object_types, qualifiers = build_vocabularies_from_local_graph(graph)
     # paths = extract_paths(graph, "event:14389", max_depth=2) 
