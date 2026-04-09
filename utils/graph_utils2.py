@@ -2,7 +2,6 @@ import pm4py
 import pandas as pd
 import networkx as nx
 
-
 def build_process_graphs_ocel2(input_file_path):
     """
     Builds:
@@ -146,3 +145,8 @@ def build_process_graphs_ocel2(input_file_path):
             )
 
     return G_behavior, G_context
+
+def load_graphml_to_networkx(graphml_file_path) -> nx.DiGraph:
+    G = nx.read_graphml(graphml_file_path) 
+    print(f"Loaded Graph with {G.number_of_nodes()} nodes.")
+    return G
