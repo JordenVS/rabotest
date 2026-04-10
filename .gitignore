@@ -10,3 +10,4 @@ claude/
 test.*
 results*/
 eval/data
+paths_*

@@ -44,6 +44,9 @@ import os
 import sys
 from typing import Dict, List, Tuple
 
+import pm4py #TODO remove pm4py dependency from graph_utils and this file after OCEL loading refactor
+from gcr.gcr import build_events_dict, build_event_successors_from_g_behavior
+
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
@@ -55,8 +58,8 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from utils.graph_utils import load_graphml_to_networkx
-#from gcr.processors import GCRProcessAgent
-from gcr.processors2 import GCRProcessAgent, DualGCRProcessAgent
+from gcr.processors import GCRProcessAgent
+#from gcr.processors2 import GCRProcessAgent, DualGCRProcessAgent
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +86,7 @@ def save_jsonl(records: List[Dict], path: str) -> None:
 def generate_paths(
     questions: List[Dict],
     agent: GCRProcessAgent,
-    dualagent: DualGCRProcessAgent,
+#    dualagent: DualGCRProcessAgent,
     constrained: bool,
     num_paths: int,
     max_depth: int,
@@ -104,7 +107,8 @@ def generate_paths(
         topic_entities = q.get("topic_entities", [])
         seed_entity = topic_entities[0] if topic_entities else None
 
-        if seed_entity is None or seed_entity not in agent.graph:
+    #    if seed_entity is None or seed_entity not in agent.graph:
+        if seed_entity is None:
             records_local.append({
                 "id": q["id"],
                 "paths": [],
@@ -143,7 +147,7 @@ def generate_paths(
 
         if constrained:
             try:
-                timing = dualagent.timed_generate(
+                timing = agent.timed_generate(
                     seed_entity=seed_entity,
                     question=q["question"],
                     num_paths=num_paths,
@@ -243,15 +247,20 @@ def main() -> None:
 
     # Load agent once — shared for both runs
     print(f"Loading path-generation model: {args.model}")
-    agent = GCRProcessAgent(args.model, G_local, device=args.device)
+
+    ocel = pm4py.read_ocel2("data/ocel2-p2p.json")
+    events = build_events_dict(ocel)
+    event_successors = build_event_successors_from_g_behavior(G_local, events)
+    agent = GCRProcessAgent(args.model, events, event_successors, device=args.device)
     print("  Agent ready.\n")
-    dual_agent = DualGCRProcessAgent(args.model, G_local=G_local, G_global=G_global, device=args.device)
+    #dual_agent = DualGCRProcessAgent(args.model, G_local=G_local, G_global=G_global, device=args.device)
     print("  Dual Agent ready.\n")
 
     #--- Constrained ---
     print("--- Generating CONSTRAINED paths local ---")
     constrained_records_local, constrained_records_global= generate_paths(
-        questions, agent, dual_agent,
+        questions, agent,
+ #       questions, agent, dual_agent,
         constrained=True,
         num_paths=args.num_paths,
         max_depth=args.max_depth,
@@ -269,7 +278,8 @@ def main() -> None:
     if not args.skip_unconstrained:
         print("\n--- Generating UNCONSTRAINED paths ---")
         unconstrained_records_local, unconstrained_records_global = generate_paths(
-            questions, agent, dual_agent,
+            questions, agent,
+#            questions, agent, dual_agent,
             constrained=False,
             num_paths=args.num_paths,
             max_depth=args.max_depth,

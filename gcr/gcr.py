@@ -1,9 +1,9 @@
-from event import Event
-from trie import ProcessTrie
+from gcr.trie import ProcessTrie
 from typing import List, Set, Dict, Tuple
 from transformers import AutoTokenizer
 import networkx as nx
 from collections import defaultdict
+from gcr.event import Event
 
 def linearize_event_path(path: List[Event], sep: str = " ") -> str:
     """
@@ -15,21 +15,21 @@ def linearize_event_path(path: List[Event], sep: str = " ") -> str:
         for e in path
     )
 
-def build_event_successors_from_g_behavior(G_behavior: nx.DiGraph):
-    """
-    Build EVENT_SUCCESSORS from the behavioral graph.
+# def build_event_successors_from_g_behavior(G_behavior: nx.DiGraph):
+#     """
+#     Build EVENT_SUCCESSORS from the behavioral graph.
 
-    Returns:
-      dict: event_id -> list of successor event_ids
-    """
-    event_successors = defaultdict(list)
+#     Returns:
+#       dict: event_id -> list of successor event_ids
+#     """
+#     event_successors = defaultdict(list)
 
-    for u, v, data in G_behavior.edges(data=True):
-        # Only follow behavioral edges
-        if data.get("edge_type") == "behavior":
-            event_successors[u].append(v)
+#     for u, v, data in G_behavior.edges(data=True):
+#         # Only follow behavioral edges
+#         if data.get("edge_type") == "behavior":
+#             event_successors[u].append(v)
 
-    return dict(event_successors)
+#     return dict(event_successors)
     
 def build_event_successors_from_g_behavior(
     G_behavior: nx.DiGraph,
@@ -143,6 +143,48 @@ def build_events_dict(ocel) -> Dict[str, Event]:
             activity=activity,
             objects=event_objects.get(eid, set()),
             object_types=event_object_types.get(eid, set()),
+        )
+
+    return events
+
+def build_events_dict_from_context_graph(G_context: nx.Graph) -> Dict[str, Event]:
+    """
+    Reconstruct event objects from a saved OCEL context graph.
+
+    This avoids reloading the original OCEL dataset by inferring event-object
+    memberships from participation edges in the graph.
+    """
+    event_objects = defaultdict(set)
+    event_object_types = defaultdict(set)
+
+    for u, v, data in G_context.edges(data=True):
+        if data.get("edge_type") != "participation":
+            continue
+
+        u_type = G_context.nodes[u].get("entity_type")
+        v_type = G_context.nodes[v].get("entity_type")
+
+        if u_type == "Event" and v_type == "Object":
+            event_objects[u].add(v)
+            event_object_types[u].add(
+                G_context.nodes[v].get("object_type", "")
+            )
+        elif u_type == "Object" and v_type == "Event":
+            event_objects[v].add(u)
+            event_object_types[v].add(
+                G_context.nodes[u].get("object_type", "")
+            )
+
+    events = {}
+    for node_id, attrs in G_context.nodes(data=True):
+        if attrs.get("entity_type") != "Event":
+            continue
+
+        events[node_id] = Event(
+            eid=node_id,
+            activity=attrs.get("activity", ""),
+            objects=event_objects.get(node_id, set()),
+            object_types=event_object_types.get(node_id, set()),
         )
 
     return events

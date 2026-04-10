@@ -1,7 +1,8 @@
 #from utils.download_files import download_json_from_zenodo
 #from gcr.processors import GCRProcessAgent
-#from utils.preprocess_pm4py import get_docs_from_pm4py, to_langchain_docs
+from utils.preprocess_pm4py import get_docs_from_pm4py
 #from utils.graph_utils import ocel_to_graph_with_pm4py, load_graphml_to_networkx, build_vocabularies_from_local_graph, build_global_context_from_ocel
+from utils.graph_utils2 import build_process_graphs_ocel2, build_ocdfg_from_ocel2
 #from eval.generate_eval_dataset import build_all_datasets
 from rag.rag import get_retriever, get_retriever_from_db, create_rag_chain
 #from graphrag.graphrag import perform_local_search
@@ -27,30 +28,31 @@ if __name__ == "__main__":
     #      print("\n")
     # print("Creating retriever...")
 
-    if os.path.exists(DOCS_CACHE):
-        print("Loading docs from cache...")
-        with open(DOCS_CACHE, "rb") as f:
-            docs = pickle.load(f)
-    else:
-        # print("Building docs from pm4py (slow)...")
-        # docs = get_docs_from_pm4py("data/ocel2-p2p.json")
-        # os.makedirs("cache", exist_ok=True)
-        # with open(DOCS_CACHE, "wb") as f:
-        #     pickle.dump(docs, f)
-        # print(f"Docs cached to {DOCS_CACHE}.")
-        print("Loading docs from cache failed. Please run the script once to build the cache.")
+    # if os.path.exists(DOCS_CACHE):
+    #     print("Loading docs from cache...")
+    #     with open(DOCS_CACHE, "rb") as f:
+    #         docs = pickle.load(f)
+    # else:
+    #     print("Building docs from pm4py (slow)...")
+    #     docs = get_docs_from_pm4py("data/ocel2-p2p.json")
+    #     os.makedirs("cache", exist_ok=True)
+    #     with open(DOCS_CACHE, "wb") as f:
+    #         pickle.dump(docs, f)
+    #     print(f"Docs cached to {DOCS_CACHE}.")
+    #     print("Loading docs from cache failed. Please run the script once to build the cache.")
 
     # retriever_openai = get_retriever(docs, "./faiss_db_openai", embedding_backend="openai")
     # print("OpenAI retriever is ready.")
-    retriever_minilm = get_retriever(docs, "./faiss_db_minilm", embedding_backend="minilm")
-    print("MiniLM retriever is ready.")
+    # retriever_minilm = get_retriever(docs, "./faiss_db_minilm", embedding_backend="minilm")
+    # print("MiniLM retriever is ready.")
     # retriever_e5 = get_retriever(docs, "./faiss_db_e5", embedding_backend="e5")
     # print("E5 retriever is ready.")
     # retriever_bge = get_retriever(docs, "./faiss_db_bge", embedding_backend="bge")
     # print("BGE retriever is ready.")
 
 
-
+    G_behavior, G_context = build_process_graphs_ocel2("data/ocel2-p2p.json", "graphs/behavior_graph.graphml", "graphs/context_graph.graphml")
+    ocfg = build_ocdfg_from_ocel2("data/ocel2-p2p.json")
     #docs = get_docs_from_pm4py("data/ocel2-p2p.json")
     #docs.sort(key=lambda d: d.metadata.get("id", ""))
     #for doc in docs[:10]:

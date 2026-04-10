@@ -4,7 +4,7 @@ from typing import List, Dict
 from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList
 
 from .trie import ProcessTrie
-from .gcr2 import enumerate_object_valid_paths, linearize_event_path
+from .gcr import enumerate_object_valid_paths, linearize_event_path
 
 class GCRProcessProcessor(torch.nn.Module):
     """
