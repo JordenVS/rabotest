@@ -26,6 +26,8 @@ def build_process_graphs_ocel2(input_file_path, output_file_path_behavior=None, 
     # --------------------------------------------------
     G_behavior = nx.DiGraph()
     print("Building behavioral graph (events only)...")
+    G_context = nx.MultiDiGraph()
+    print("Building context graph (events + objects)...")
 
     # --- Add Event nodes ---
     for _, row in events_df.iterrows():
@@ -78,6 +80,13 @@ def build_process_graphs_ocel2(input_file_path, output_file_path_behavior=None, 
                 edge_type="behavior",
                 object_type=obj_type,
             )
+
+            G_context.add_edge(
+                event_ids[i],
+                event_ids[i + 1],
+                label=f"NEXT_FOR_{obj_type}",
+                edge_type="lifecycle_flow"  # Distinct label for context
+            )
             lifecycle_edge_count += 1
 
     print(f"Added {lifecycle_edge_count} lifecycle edges.")
@@ -85,8 +94,6 @@ def build_process_graphs_ocel2(input_file_path, output_file_path_behavior=None, 
     # --------------------------------------------------
     # Graph B: CONTEXT GRAPH (Events + Objects)
     # --------------------------------------------------
-    G_context = nx.MultiDiGraph()
-    print("Building context graph (events + objects)...")
 
     # --- Add Object nodes ---
     for _, row in objects_df.iterrows():

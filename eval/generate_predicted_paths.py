@@ -66,6 +66,7 @@ import json
 import os
 import sys
 from typing import Dict, List
+import networkx as nx
 
 from tqdm import tqdm
 
@@ -130,6 +131,8 @@ def generate_paths(
     agent: GCRProcessAgent,
     *,
     constrained: bool,
+    enrich: bool,
+    G_context: nx.DiGraph,
     num_paths: int,
     max_depth: int,
     out_path: str,
@@ -151,20 +154,20 @@ def generate_paths(
                  'GCR w/o constraint' in Luo et al., 2025, Fig. 5).
     """
     label = "constrained" if constrained else "unconstrained"
-    done = _load_done_ids(out_path)
+    # done = _load_done_ids(out_path)
 
-    skipped = sum(1 for q in questions if q.get("instance_id") in done)
-    if skipped:
-        print(f"  [{label}] Resuming — skipping {skipped} already-completed questions.")
+    # skipped = sum(1 for q in questions if q.get("instance_id") in done)
+    # if skipped:
+    #     print(f"  [{label}] Resuming — skipping {skipped} already-completed questions.")
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
-    with open(out_path, "a", encoding="utf-8") as f_out:
+    with open(out_path, "w", encoding="utf-8") as f_out:
         for q in tqdm(questions, desc=f"[{label}]"):
             instance_id = q.get("instance_id", "???")
 
-            if instance_id in done:
-                continue
+            # if instance_id in done:
+            #     continue
 
             anchor = q.get("anchor_object", {}).get("oid")
 
@@ -176,6 +179,8 @@ def generate_paths(
                         anchor_object=anchor,
                         question=q["question"],
                         constrained=constrained,
+                        enrich=enrich,
+                        G_context=G_context,
                         num_paths=num_paths,
                         max_depth=max_depth,
                     )
@@ -250,6 +255,10 @@ def parse_args() -> argparse.Namespace:
         help="Use only the first N questions — useful for quick testing"
     )
     p.add_argument(
+        "--skip_enrich", action="store_true",
+        help="Skip the enriched GCR variant (grounded object context)"
+    )
+    p.add_argument(
         "--skip_unconstrained", action="store_true",
         help="Skip the unconstrained ablation run (saves time)"
     )
@@ -306,6 +315,8 @@ def main() -> None:
     generate_paths(
         questions, agent,
         constrained=True,
+        enrich=not args.skip_enrich,
+        G_context=G_context,
         num_paths=args.num_paths,
         max_depth=args.max_depth,
         out_path=os.path.join(args.out_dir, "predicted_paths_constrained.jsonl"),
@@ -319,6 +330,8 @@ def main() -> None:
         generate_paths(
             questions, agent,
             constrained=False,
+            enrich=False,
+            G_context=G_context,
             num_paths=args.num_paths,
             max_depth=args.max_depth,
             out_path=os.path.join(args.out_dir, "predicted_paths_unconstrained.jsonl"),
