@@ -15,22 +15,6 @@ def linearize_event_path(path: List[Event], sep: str = " ") -> str:
         for e in path
     )
 
-# def build_event_successors_from_g_behavior(G_behavior: nx.DiGraph):
-#     """
-#     Build EVENT_SUCCESSORS from the behavioral graph.
-
-#     Returns:
-#       dict: event_id -> list of successor event_ids
-#     """
-#     event_successors = defaultdict(list)
-
-#     for u, v, data in G_behavior.edges(data=True):
-#         # Only follow behavioral edges
-#         if data.get("edge_type") == "behavior":
-#             event_successors[u].append(v)
-
-#     return dict(event_successors)
-    
 def build_event_successors_from_g_behavior(
     G_behavior: nx.DiGraph,
     events: Dict[str, Event],
