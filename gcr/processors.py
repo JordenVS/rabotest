@@ -100,7 +100,7 @@ class GCRProcessAgent:
         max_depth: int = 5,
         max_new_tokens: int = 100,
         trie: Optional[ProcessTrie] = None,
-    ) -> List[str]:
+    ) -> Tuple[List[str], int]:
 
         prompt = (f"Question: {question}\n"
                  f"Context: Found object {anchor_object}.\n"
@@ -128,7 +128,7 @@ class GCRProcessAgent:
         return [
             self.tokenizer.decode(o[prompt_len:], skip_special_tokens=True)
             for o in outputs
-        ]
+        ], prompt_len
     
     def generate_unconstrained(
         self,
@@ -137,8 +137,8 @@ class GCRProcessAgent:
         G_context: nx.DiGraph,
         num_paths: int = 3,
         max_new_tokens: int = 100,
-        max_hops: int = 2
-    ) -> List[str]:
+        max_hops: int = 3
+    ) -> Tuple[List[str], int]:
         """
         Enhanced unconstrained generation for ablation studies.
         Provides the LLM with the local graph context in the prompt 
@@ -151,9 +151,9 @@ class GCRProcessAgent:
         if anchor_object in G_context:
             # Use simple BFS or path enumeration to get raw graph strings
             # Similar to GCR path extraction but used as prompt text only
-            from .gcr import get_raw_neighborhood_strings
-            subgraph_paths = get_raw_neighborhood_strings(
-                G_context, anchor_object, max_hops=max_hops
+            from utils.graph_utils import collect_unique_path_strings
+            subgraph_paths = collect_unique_path_strings(
+                G_context, [anchor_object], max_depth=max_hops
             )[:10] # Limit to 10 for prompt efficiency
         
         context_str = "\n".join(subgraph_paths) if subgraph_paths else "No local context found."
@@ -192,7 +192,7 @@ class GCRProcessAgent:
         return [
             self.tokenizer.decode(o[prompt_len:], skip_special_tokens=True).strip()
             for o in outputs
-        ]
+        ], prompt_len
     
     def reify_generated_path(self, generated_string, anchor_object, G_context):
         # 1. Normalize LLM output strings
@@ -304,13 +304,6 @@ class GCRProcessAgent:
         if not start_events:
             print(f"  [WARNING] No start events found for object '{anchor_object}'.")
 
-        prompt = (
-            f"Question: {question}\n"
-            f"Context: Found object {anchor_object}.\n"
-            f"Reasoning Path: "
-        )
-        prompt_tokens = len(self.tokenizer.encode(prompt, add_special_tokens=False))
-
         trie_build_s = 0.0
         enrich_s = 0.0
         context_block = None
@@ -321,7 +314,7 @@ class GCRProcessAgent:
             trie_build_s = time.perf_counter() - t0
 
             t1 = time.perf_counter()
-            paths = self.generate_paths(
+            paths, prompt_tokens = self.generate_paths(
                 start_events=start_events,
                 anchor_object=anchor_object,
                 question=question,
@@ -345,15 +338,18 @@ class GCRProcessAgent:
                 paths=reified_paths,
                 anchor_object=anchor_object,
                 G_context=G_context,
+                max_neighbors=max_depth,
             )
             enrich_s = time.perf_counter() - t2
         else:
             t1 = time.perf_counter()
-            paths = self.generate_unconstrained(
+            paths, prompt_tokens = self.generate_unconstrained(
                 anchor_object=anchor_object,
                 question=question,
+                G_context=G_context,
                 num_paths=num_paths,
                 max_new_tokens=max_new_tokens,
+                max_hops=max_depth,
             )
             generation_s = time.perf_counter() - t1
 

@@ -136,83 +136,58 @@ def build_events_dict(ocel) -> Dict[str, Event]:
 def enrich_paths_with_context(
     paths: List[List["Event"]],
     anchor_object: str,
-    G_context: nx.DiGraph,
+    G_context: nx.MultiDiGraph,
+    max_neighbors: int = 5,
 ) -> str:
     """
-    Enrich a list of constrained event paths with object context fetched from
-    G_context, producing a structured natural-language string for injection into
-    a large LLM prompt.
-
-    Because the paths are guaranteed valid graph walks (produced by the
-    ProcessTrie), every object retrieved here is provably connected to the
-    anchor — a stronger grounding guarantee than similarity-based retrieval.
-
-    For each event in each path the function collects:
-      - Objects that participated in that event (via participation edges)
-      - Each object's stored attributes (all node attrs except bookkeeping keys)
-      - Object-to-object relations involving those objects (o2o edges)
-
-    Deduplication is applied at the object level across all paths so the same
-    object description never appears twice in the context block.
-
-    Parameters
-    ----------
-    paths:
-        Output of enumerate_object_valid_paths — lists of Event objects.
-    anchor_object:
-        The query anchor (e.g. "material:835"). Always described first.
-    G_context:
-        Heterogeneous context graph (Event + Object nodes, participation /
-        o2o edges) built by ocel_to_graph_with_pm4py.
-
-    Returns
-    -------
-    str
-        Structured context block ready to be inserted into an LLM prompt, e.g.:
-
-            Anchor object: material:835 (type: material)
-
-            Path 1: Create Purchase Requisition → Approve Purchase Requisition
-              Step 1 — Create Purchase Requisition
-                Objects involved: purchase_requisition:12, material:835
-                  purchase_requisition:12 → related to: purchase_order:55 [o2o]
-              Step 2 — Approve Purchase Requisition
-                Objects involved: purchase_requisition:12
-
-            [Object details]
-              material:835 (type: material)
-                Attributes: price=120.0, unit=EA
-              purchase_requisition:12 (type: purchase_requisition)
-                Attributes: quantity=5
+    Enriches process paths with a 'Capped' context to prevent token explosion.
+    - Caps object-to-object relations at max_neighbors.
+    - Deduplicates redundant relations.
+    - Includes all attributes (Whitelisting Removed).
     """
     _SKIP_ATTRS = {"entity_type", "object_type"}
 
     def _obj_type(oid: str) -> str:
         if oid not in G_context.nodes:
-            return ""
-        return G_context.nodes[oid].get("object_type", "")
+            return "unknown"
+        return G_context.nodes[oid].get("object_type", "object")
 
     def _obj_attrs(oid: str) -> dict:
+        """Returns all attributes except bookkeeping keys and empty values."""
         if oid not in G_context.nodes:
             return {}
+        node_data = G_context.nodes[oid]
+        
         return {
-            k: v for k, v in G_context.nodes[oid].items()
-            if k not in _SKIP_ATTRS
-            and not k.startswith("ocel:")
-            and str(v) not in ("", "nan", "None", "none")
+            k.replace("ocel:", ""): v for k, v in node_data.items()
+            if k not in _SKIP_ATTRS 
+            and not k.startswith("ocel:") # Keep cleaning OCEL internal prefixes
+            and str(v).lower() not in ("", "nan", "none")
         }
 
-    def _o2o_relations(oid: str) -> List[Tuple[str, str]]:
-        """[(neighbour_id, relation_label), ...] for object-to-object edges."""
+    def _o2o_relations(oid: str, limit: int) -> List[Tuple[str, str]]:
+        """Finds unique Object-to-Object relations up to a specified limit."""
         if oid not in G_context.nodes:
             return []
+        
         rels = []
-        for _, nbr, data in G_context.out_edges(oid, data=True):
-            if G_context.nodes.get(nbr, {}).get("entity_type") == "Object":
-                rels.append((nbr, data.get("label", data.get("edge_type", "related_to"))))
-        for src, _, data in G_context.in_edges(oid, data=True):
-            if G_context.nodes.get(src, {}).get("entity_type") == "Object":
-                rels.append((src, data.get("label", data.get("edge_type", "related_to"))))
+        seen = set()
+        
+        # Check both directions for structural context
+        edges = list(G_context.out_edges(oid, data=True)) + list(G_context.in_edges(oid, data=True))
+        
+        for u, v, data in edges:
+            neighbor = v if u == oid else u
+            
+            if G_context.nodes.get(neighbor, {}).get("entity_type") == "Object":
+                label = data.get("label", data.get("qualifier", "related_to"))
+                
+                if (neighbor, label) not in seen:
+                    rels.append((neighbor, label))
+                    seen.add((neighbor, label))
+                    
+                if len(rels) >= limit:
+                    break
         return rels
 
     lines: List[str] = []
@@ -228,22 +203,23 @@ def enrich_paths_with_context(
         for step_idx, event in enumerate(path, start=1):
             lines.append(f"  Step {step_idx} — {event.activity}")
 
-            step_objs = sorted(event.objects)
+            step_objs = sorted(list(event.objects))
             if step_objs:
                 lines.append(f"    Objects involved: {', '.join(step_objs)}")
+            
             for oid in step_objs:
-                o2o = _o2o_relations(oid)
+                o2o = _o2o_relations(oid, limit=max_neighbors)
                 if o2o:
                     rel_str = ", ".join(f"{nbr} [{lbl}]" for nbr, lbl in o2o)
                     lines.append(f"      {oid} → related to: {rel_str}")
+                
                 if oid not in seen_objects:
                     seen_objects.add(oid)
                     attrs = _obj_attrs(oid)
                     detail = f"  {oid} (type: {_obj_type(oid)})"
                     if attrs:
-                        detail += "\n    Attributes: " + ", ".join(
-                            f"{k}={v}" for k, v in attrs.items()
-                        )
+                        # Now processes all attributes found in the node
+                        detail += "\n    Attributes: " + ", ".join(f"{k}={v}" for k, v in attrs.items())
                     object_detail_lines.append(detail)
 
         lines.append("")
