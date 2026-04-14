@@ -5,7 +5,7 @@ from typing import List, Dict, Optional, Tuple
 from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList
 
 from .trie import ProcessTrie
-from .gcr import enumerate_object_valid_paths, linearize_event_path, enrich_paths_with_context
+from .gcr import enumerate_object_valid_paths, linearize_event_path, enrich_paths_with_context, reify_generated_path
 
 class GCRProcessProcessor(torch.nn.Module):
     """
@@ -194,53 +194,6 @@ class GCRProcessAgent:
             for o in outputs
         ], prompt_len
     
-    def reify_generated_path(self, generated_string, anchor_object, G_context):
-        # 1. Normalize LLM output strings
-        activity_names = [
-            s.replace("Event:", "").replace("_", " ").strip() 
-            for s in generated_string.split()
-        ]
-        
-        # 2. Find candidate EIDs using G_context edges
-        # G_context contains "participation" edges between Events and Objects
-        if anchor_object not in G_context:
-            print(f" [WARNING] Anchor {anchor_object} not in G_context")
-            return []
-
-        # Get all event nodes connected to this object in G_context
-        candidate_eids = [
-            neighbor for neighbor in G_context.neighbors(anchor_object)
-            if G_context.nodes[neighbor].get("entity_type") == "Event"
-        ]
-
-        # 3. Create Event objects with metadata for sorting
-        candidate_events = []
-        for eid in candidate_eids:
-            node_data = G_context.nodes[eid]
-            # We wrap the data back into your Event class or a temporary dict
-            candidate_events.append({
-                "eid": eid,
-                "activity": node_data.get("activity"),
-                "timestamp": node_data.get("timestamp", "0000")
-            })
-
-        # 4. Sort by timestamp to maintain process-aware order
-        candidate_events.sort(key=lambda x: str(x["timestamp"]))
-
-        reified_path = []
-        last_idx = -1
-        for act_name in activity_names:
-            found = False
-            for i in range(last_idx + 1, len(candidate_events)):
-                if candidate_events[i]["activity"] == act_name:
-                    # Retrieve the full Event object from your main storage
-                    reified_path.append(self.events[candidate_events[i]["eid"]])
-                    last_idx = i
-                    found = True
-                    break
-        
-        return reified_path
-    
     def timed_generate(
         self,
         anchor_object: str,
@@ -329,7 +282,7 @@ class GCRProcessAgent:
             t2 = time.perf_counter()
 
             reified_paths = [
-                self.reify_generated_path(p, anchor_object, G_context) 
+                reify_generated_path(self, generated_string=p, anchor_object=anchor_object, G_context=G_context)
                 for p in paths[:num_paths]
             ]
             
@@ -338,7 +291,7 @@ class GCRProcessAgent:
                 paths=reified_paths,
                 anchor_object=anchor_object,
                 G_context=G_context,
-                max_neighbors=max_depth,
+                max_depth=max_depth,
             )
             enrich_s = time.perf_counter() - t2
         else:

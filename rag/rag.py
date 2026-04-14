@@ -178,7 +178,7 @@ def _build_llm(backend: LLMBackend, model: str, **kwargs):
         pipe = hf_pipeline(
             "text-generation",
             model=model,
-            max_new_tokens=kwargs.get("max_new_tokens", 512),
+   #         max_new_tokens=kwargs.get("max_new_tokens", 512),
             device_map="auto",
         )
         return HuggingFacePipeline(pipeline=pipe)

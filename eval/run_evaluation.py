@@ -1,46 +1,60 @@
 """
-eval/evaluate.py
-----------------
-Scores the predictions written by generate_predicted_paths.py.
+eval/run_evaluation.py
+======================
+Stage 2 of the two-stage GCR evaluation pipeline.
+
+Loads predicted paths from generate_predicted_paths.py, generates final
+natural-language answers using four systems, scores them, and writes a
+results table.
+
+Systems
+-------
+gcr_constrained   — constrained GCR paths + enriched object context → large LLM
+gcr_unconstrained — unconstrained paths only → large LLM
+rag               — FAISS dense retrieval → large LLM
+graphrag          — 1-hop subgraph context → large LLM
 
 Metrics
 -------
-For **next_step** questions (generative, open-ended):
-  - Exact Match (EM)       — prediction contains gold_answer as a substring
-                              (case-insensitive, normalised).
-  - Activity F1            — token-level F1 between predicted and gold activity
-                              string (standard QA metric; Rajpurkar et al., 2016).
-  - ROUGE-L                — longest-common-subsequence recall/precision/F1
-                              (Lin, 2004); standard for generative eval.
+next_step      : Exact Match (EM), token F1, ROUGE-L F1, MRR (over GCR beams)
+counterfactual : Binary accuracy (yes / no polarity)
+all systems    : answer generation latency (mean, p95)
 
-For **counterfactual** questions (binary Yes/No):
-  - Accuracy               — whether the prediction contains "no" / "yes" in
-                              the expected polarity.
-  - F1 (binary)            — treating the task as binary classification.
-
-Overall (all families):
-  - Mean Reciprocal Rank (MRR) — position of first correct activity mention
-                                  across GCR's k beam outputs.
-  - Path Validity Rate (PVR)   — fraction of GCR predictions that constitute
-                                  a valid walk in the graph (GCR-specific).
-  - Latency (mean / p95)       — wall-clock seconds per instance.
+Output files
+------------
+<out_dir>/answers.jsonl          one record per (instance, system)
+<out_dir>/results_table.csv      aggregated per-system metrics
+<out_dir>/results_table.tex      LaTeX table for the paper
 
 Usage
 -----
-    python -m eval.evaluate \
-        --predictions eval/predictions.jsonl \
-        --graph       test2.graphml \
-        --out-csv     eval/results_table.csv \
-        [--out-json   eval/results_full.json]
+    python -m eval.run_evaluation \\
+        --dataset              eval/sampled_100.json \\
+        --constrained_paths    results/predicted_paths_constrained.jsonl \\
+        --unconstrained_paths  results/predicted_paths_unconstrained.jsonl \\
+        --graph_context        graphs/context_graph.graphml \\
+        --faiss_db             faiss_db_bge \\
+        --docs_cache           cache/pm4py_docs.pkl \\
+        --llm_model            Qwen/Qwen2.5-7B-Instruct \\
+        --emb_backend          bge \\
+        --out_dir              results \\
+        --device               cpu
 
-The CSV is formatted for direct inclusion in a LaTeX table via pandas
-``to_latex()``.
+    Quick test (5 instances):
+        --limit 5
+
+    Skip slow systems:
+        --skip_rag --skip_graphrag
 
 References
 ----------
-Rajpurkar et al. (2016). SQuAD: 100,000+ Questions for Machine
-    Comprehension of Text. EMNLP.
-Lin, C.-Y. (2004). ROUGE: A Package for Automatic Evaluation of Summaries.
+Luo, L., Zhao, Z., Haffari, G., Li, Y.-F., Gong, C., & Pan, S. (2025).
+    Graph-constrained reasoning: Faithful reasoning on knowledge graphs
+    with large language models. ICML 2025.
+Rajpurkar, P., Zhang, J., Lopyrev, K., & Liang, P. (2016).
+    SQuAD: 100,000+ questions for machine comprehension of text. EMNLP.
+Lin, C.-Y. (2004).
+    ROUGE: A package for automatic evaluation of summaries.
     ACL Workshop on Text Summarisation Branches Out.
 """
 
@@ -48,126 +62,124 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import pickle
 import re
 import string
-from collections import defaultdict
+import sys
+import time
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
+from dotenv import load_dotenv
 
 import numpy as np
+from tqdm import tqdm
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Text normalisation (mirrors SQuAD eval script; Rajpurkar et al., 2016)
+# Project root
 # ---------------------------------------------------------------------------
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+
+# ===========================================================================
+# I/O helpers
+# ===========================================================================
+
+def load_jsonl(path: str) -> List[Dict]:
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(l) for l in f if l.strip()]
+
+
+def load_dataset(path: str) -> List[Dict]:
+    """Accepts JSON array or JSONL."""
+    with open(path, encoding="utf-8") as f:
+        content = f.read().strip()
+    if content.startswith("["):
+        return json.loads(content)
+    return [json.loads(l) for l in content.splitlines() if l.strip()]
+
+
+def _load_done(path: str) -> set:
+    """(instance_id, system) pairs already written — for resume support."""
+    done = set()
+    if not os.path.exists(path):
+        return done
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+                done.add((r["instance_id"], r["system"]))
+            except (json.JSONDecodeError, KeyError):
+                pass
+    return done
+
+
+def _append(path: str, record: Dict) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+
+
+# ===========================================================================
+# Metrics  (Rajpurkar et al., 2016; Lin, 2004)
+# ===========================================================================
 
 def _normalise(text: str) -> str:
-    """Lowercase, remove punctuation and extra whitespace."""
     text = text.lower()
     text = text.translate(str.maketrans("", "", string.punctuation))
     return " ".join(text.split())
 
 
-def _tokenise(text: str) -> List[str]:
+def _tokens(text: str) -> List[str]:
     return _normalise(text).split()
 
 
-# ---------------------------------------------------------------------------
-# Token-level F1  (Rajpurkar et al., 2016)
-# ---------------------------------------------------------------------------
+def exact_match(prediction: str, gold: str) -> float:
+    return float(_normalise(gold) in _normalise(prediction))
+
 
 def token_f1(prediction: str, gold: str) -> float:
-    pred_tokens = _tokenise(prediction)
-    gold_tokens = _tokenise(gold)
-
-    if not pred_tokens or not gold_tokens:
-        return float(pred_tokens == gold_tokens)
-
-    common = set(pred_tokens) & set(gold_tokens)
-    if not common:
+    """Token-level F1 (Rajpurkar et al., 2016)."""
+    pred_toks = _tokens(prediction)
+    gold_toks = _tokens(gold)
+    if not pred_toks or not gold_toks:
+        return float(pred_toks == gold_toks)
+    common = Counter(pred_toks) & Counter(gold_toks)
+    num_same = sum(common.values())
+    if num_same == 0:
         return 0.0
-
-    # Count occurrences (not just set membership)
-    from collections import Counter
-    pred_counts = Counter(pred_tokens)
-    gold_counts = Counter(gold_tokens)
-    num_same = sum(min(pred_counts[t], gold_counts[t]) for t in common)
-
-    precision = num_same / len(pred_tokens)
-    recall    = num_same / len(gold_tokens)
-    return (2 * precision * recall) / (precision + recall)
+    p = num_same / len(pred_toks)
+    r = num_same / len(gold_toks)
+    return 2 * p * r / (p + r)
 
 
-# ---------------------------------------------------------------------------
-# ROUGE-L  (Lin, 2004)
-# ---------------------------------------------------------------------------
-
-def _lcs_length(a: List[str], b: List[str]) -> int:
-    """Standard dynamic-programming LCS length."""
+def _lcs(a: List[str], b: List[str]) -> int:
     m, n = len(a), len(b)
     dp = [[0] * (n + 1) for _ in range(m + 1)]
     for i in range(1, m + 1):
         for j in range(1, n + 1):
-            if a[i - 1] == b[j - 1]:
-                dp[i][j] = dp[i - 1][j - 1] + 1
-            else:
-                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+            dp[i][j] = dp[i-1][j-1] + 1 if a[i-1] == b[j-1] else max(dp[i-1][j], dp[i][j-1])
     return dp[m][n]
 
 
-def rouge_l(prediction: str, gold: str) -> Dict[str, float]:
-    pred_tokens = _tokenise(prediction)
-    gold_tokens = _tokenise(gold)
-
-    if not pred_tokens or not gold_tokens:
-        f = float(pred_tokens == gold_tokens)
-        return {"precision": f, "recall": f, "f1": f}
-
-    lcs = _lcs_length(pred_tokens, gold_tokens)
-    precision = lcs / len(pred_tokens)
-    recall    = lcs / len(gold_tokens)
-    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) else 0.0
-    return {"precision": precision, "recall": recall, "f1": f1}
+def rouge_l(prediction: str, gold: str) -> float:
+    """ROUGE-L F1 (Lin, 2004)."""
+    p_toks = _tokens(prediction)
+    g_toks = _tokens(gold)
+    if not p_toks or not g_toks:
+        return float(p_toks == g_toks)
+    lcs = _lcs(p_toks, g_toks)
+    prec = lcs / len(p_toks)
+    rec  = lcs / len(g_toks)
+    return 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
 
 
-# ---------------------------------------------------------------------------
-# Exact match (substring, case-insensitive)
-# ---------------------------------------------------------------------------
-
-def exact_match(prediction: str, gold: str) -> bool:
-    return _normalise(gold) in _normalise(prediction)
-
-
-# ---------------------------------------------------------------------------
-# Counterfactual accuracy  (binary)
-# ---------------------------------------------------------------------------
-
-def counterfactual_correct(prediction: str, gold_answer: str) -> bool:
-    """
-    For counterfactual questions the gold_answer is "Yes" or "No".
-    We check whether the first polar word in the prediction matches.
-    """
-    p = _normalise(prediction)
-    gold_polar = _normalise(gold_answer)
-
-    # Look for explicit yes/no in prediction
-    has_no  = bool(re.search(r"\bno\b",  p))
-    has_yes = bool(re.search(r"\byes\b", p))
-
-    if gold_polar == "no":
-        # Correct if "no" present AND "yes" absent (or both absent → conservative)
-        return has_no and not has_yes
-    else:
-        return has_yes and not has_no
-
-
-# ---------------------------------------------------------------------------
-# MRR  (over GCR beam outputs)
-# ---------------------------------------------------------------------------
-
-def mrr_from_beams(beams: List[str], gold: str) -> float:
-    """
-    Mean Reciprocal Rank given a ranked list of beam outputs and a gold string.
-    Returns 1/rank of the first beam that contains the gold answer, else 0.
-    """
+def mrr(beams: List[str], gold: str) -> float:
+    """MRR over ranked beam outputs."""
     gold_norm = _normalise(gold)
     for rank, beam in enumerate(beams, start=1):
         if gold_norm in _normalise(beam):
@@ -175,242 +187,578 @@ def mrr_from_beams(beams: List[str], gold: str) -> float:
     return 0.0
 
 
-# ---------------------------------------------------------------------------
-# Path Validity Rate  (GCR-specific)
-# ---------------------------------------------------------------------------
-
-def is_valid_walk(path_string: str, graph) -> bool:
+def counterfactual_acc(prediction: str, gold_answer: str) -> float:
     """
-    Parse a GCR chain string and verify every consecutive node pair is
-    connected by an edge in *graph*.
-
-    Chain format:  "NodeLabel rel NodeLabel rel NodeLabel …"
-    Node labels:   "Event:Activity_Name" or "Object:type"
-
-    The node labels must map back to actual graph node IDs.  We do this
-    by building a reverse index (label → set of node IDs) once per call.
-    For large-scale eval, pass a pre-built reverse index instead.
+    Binary accuracy for counterfactual questions.
+    gold_answer is "Yes" or "No"; we check the first polar word in prediction.
     """
-    import networkx as nx
-
-    tokens = path_string.strip().split()
-    # Tokens alternate: NodeLabel, relation, NodeLabel, relation, …
-    # Extract node tokens (even indices)
-    node_tokens = tokens[::2]
-
-    if len(node_tokens) < 2:
-        return False  # trivial/empty path
-
-    # Build reverse-label → node_id mapping from graph
-    label_to_ids: Dict[str, List[str]] = defaultdict(list)
-    for nid, data in graph.nodes(data=True):
-        entity_type = data.get("entity_type", "Node")
-        raw = data.get("activity", data.get("object_type", nid))
-        label = f"{entity_type}:{raw.replace(' ', '_')}"
-        label_to_ids[label].append(nid)
-
-    # Resolve each token to candidate node IDs
-    candidates: List[List[str]] = []
-    for tok in node_tokens:
-        ids = label_to_ids.get(tok, [])
-        if not ids:
-            return False   # unresolvable label → invalid
-        candidates.append(ids)
-
-    # Check that *some* instantiation of candidates forms a valid walk
-    # (BFS over the candidate space — bounded because lists are small)
-    from itertools import product
-    for combo in product(*candidates):
-        valid = True
-        for i in range(len(combo) - 1):
-            u, v = combo[i], combo[i + 1]
-            if not graph.has_edge(u, v):
-                valid = False
-                break
-        if valid:
-            return True
-
-    return False
+    p = _normalise(prediction)
+    gold_polar = _normalise(gold_answer)
+    has_no  = bool(re.search(r"\bno\b",  p))
+    has_yes = bool(re.search(r"\byes\b", p))
+    if gold_polar == "no":
+        return float(has_no and not has_yes)
+    return float(has_yes and not has_no)
 
 
-# ---------------------------------------------------------------------------
-# Score a single record
-# ---------------------------------------------------------------------------
-
-def score_record(
-    record: Dict[str, Any],
-    graph,
-    compute_pvr: bool = True,
-) -> Dict[str, Any]:
-    prediction  = record.get("prediction", "")
-    gold        = str(record.get("gold_answer", ""))
-    family      = record.get("question_family", "unknown")
-    system      = record.get("system", "unknown")
-    beams       = record.get("metadata", {}).get("all_beams", [prediction])
-
-    scores: Dict[str, Any] = {
-        "sample_id": record["sample_id"],
-        "system":    system,
-        "family":    family,
-    }
-
-    if family == "next_step":
-        scores["em"]      = float(exact_match(prediction, gold))
-        scores["tok_f1"]  = token_f1(prediction, gold)
-        scores["rouge_l"] = rouge_l(prediction, gold)["f1"]
-        scores["mrr"]     = mrr_from_beams(beams, gold)
-
-    elif family == "counterfactual":
-        scores["cf_acc"] = float(counterfactual_correct(prediction, gold))
-        scores["em"]     = scores["cf_acc"]   # alias for unified reporting
-
-    # Path Validity Rate — meaningful mainly for GCR; computed for all
-    if compute_pvr and graph is not None:
-        scores["pvr"] = float(is_valid_walk(prediction, graph))
-
-    scores["elapsed_s"] = record.get("elapsed_s", float("nan"))
-
+def score_answer(
+    prediction: str,
+    gold_answer: str,
+    question_family: str,
+    beams: Optional[List[str]] = None,
+) -> Dict[str, float]:
+    """Compute all applicable metrics for one (prediction, gold) pair."""
+    scores: Dict[str, float] = {}
+    if question_family == "next_step":
+        scores["em"]      = exact_match(prediction, gold_answer)
+        scores["tok_f1"]  = token_f1(prediction, gold_answer)
+        scores["rouge_l"] = rouge_l(prediction, gold_answer)
+        scores["mrr"]     = mrr(beams or [prediction], gold_answer)
+    elif question_family == "counterfactual":
+        scores["cf_acc"]  = counterfactual_acc(prediction, gold_answer)
+        scores["em"]      = scores["cf_acc"]
+    else:
+        scores["em"] = exact_match(prediction, gold_answer)
     return scores
 
 
+# ===========================================================================
+# LLM answer generation
+# ===========================================================================
+
 # ---------------------------------------------------------------------------
-# Aggregate scores into a results table
+# Shared prompt builder
 # ---------------------------------------------------------------------------
 
-def aggregate(
-    score_records: List[Dict[str, Any]],
-) -> Dict[str, Dict[str, float]]:
-    """
-    Group score records by system and compute mean ± std for each metric.
+_ANSWER_PROMPT = """\
+You are a process mining assistant specialising in Procure-to-Pay (P2P) event logs.
+Answer the question using ONLY the context provided below.
+If the context does not contain enough information, say so explicitly.
+Keep your answer concise — one or two sentences.
 
-    Returns
-    -------
-    Dict mapping system_name → {metric_name: value}
-    """
-    from collections import defaultdict
-    import numpy as np
+### Context:
+{context}
 
+### Question:
+{question}
+
+### Answer:"""
+
+
+def _build_answer_prompt(context: str, question: str) -> str:
+    return _ANSWER_PROMPT.format(context=context.strip(), question=question.strip())
+
+
+# ---------------------------------------------------------------------------
+# GCR answer generation  (uses predicted paths + optional context_block)
+# ---------------------------------------------------------------------------
+
+def generate_gcr_answer(
+    record: Dict,           # one predicted-path JSONL record
+    question: str,
+    llm,
+) -> Tuple[str, float]:
+    """
+    Build the LLM prompt from the predicted paths and any enriched context,
+    then call the LLM.
+
+    The context block (when present) contains the structured object context
+    produced by enrich_paths_with_context — provably grounded in the graph.
+    Paths are listed first as the primary reasoning trace; the context block
+    follows as supporting object detail.
+    """
+    paths: List[str] = record.get("paths", [])
+    context_block: Optional[str] = record.get("context_block")
+
+    path_text = "\n".join(
+        f"  Path {i+1}: {p}" for i, p in enumerate(paths) if p
+    ) or "  (no paths generated)"
+
+    if context_block:
+        context = (
+            f"Reasoning paths (graph-constrained):\n{path_text}\n\n"
+            f"Object context:\n{context_block}"
+        )
+    else:
+        context = f"Reasoning paths:\n{path_text}"
+
+    prompt = _build_answer_prompt(context, question)
+    t0 = time.perf_counter()
+    answer = llm(prompt)
+    elapsed = time.perf_counter() - t0
+    return answer, elapsed
+
+
+# ---------------------------------------------------------------------------
+# RAG answer generation
+# ---------------------------------------------------------------------------
+
+def generate_rag_answer(
+    question: str,
+    rag_chain,
+) -> Tuple[str, float]:
+    t0 = time.perf_counter()
+    print(f"Generating RAG answer for question: {question}")
+    result = rag_chain.invoke({"question": question})
+    elapsed = time.perf_counter() - t0
+    return result.get("answer", ""), elapsed
+
+
+# ---------------------------------------------------------------------------
+# GraphRAG answer generation
+# ---------------------------------------------------------------------------
+
+def generate_graphrag_answer(
+    question: str,
+    anchor_oid: str,
+    graph,
+    graphrag_llm,
+) -> Tuple[str, float]:
+    from graphrag.graphrag import perform_local_search
+    t0 = time.perf_counter()
+    answer = perform_local_search(graph, anchor_oid, question, llm=graphrag_llm)
+    elapsed = time.perf_counter() - t0
+    return answer, elapsed
+
+
+# ---------------------------------------------------------------------------
+# LLM factory  (mirrors rag.py pattern)
+# ---------------------------------------------------------------------------
+
+def build_llm_hf(model: str, device: str = "cpu", max_new_tokens: int = 256):
+    """
+    Return a callable: prompt_str -> answer_str.
+    Uses a HuggingFace pipeline with chat-style inference when the tokenizer
+    has a chat template, plain text-generation otherwise.
+    """
+    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
+    print(f"[LLM] Loading answer-generation model: {model}")
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    model_obj = AutoModelForCausalLM.from_pretrained(
+        model,
+        torch_dtype="auto",
+        device_map=device,
+    )
+    pipe = pipeline(
+        "text-generation",
+        model=model_obj,
+        tokenizer=tokenizer,
+        max_new_tokens=max_new_tokens,
+    )
+    print("[LLM] Ready.")
+
+    def _call(prompt: str) -> str:
+        # Use chat template if available (Qwen, Llama-3, etc.)
+        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+            messages = [{"role": "user", "content": prompt}]
+            formatted = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            out = pipe(formatted)
+            generated = out[0]["generated_text"]
+            # Strip prompt prefix
+            if generated.startswith(formatted):
+                generated = generated[len(formatted):]
+        else:
+            out = pipe(prompt)
+            generated = out[0]["generated_text"]
+            if generated.startswith(prompt):
+                generated = generated[len(prompt):]
+        return generated.strip()
+
+    return _call
+
+def build_llm_openai(model: str, device: str = "cpu", max_new_tokens: int = 256):
+    """
+    Return a callable: prompt_str -> answer_str using OpenAI API.
+    Note: 'device' is ignored as the model is hosted externally.
+    """
+    from openai import OpenAI
+    
+    # It will look for OPENAI_API_KEY in your environment variables
+    client = OpenAI()
+
+    print(f"[LLM] Initializing API-based model: {model}")
+
+    def _call(prompt: str) -> str:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=max_new_tokens,
+                temperature=0.0, # Recommended for consistent evaluation
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"API Error: {e}")
+            return ""
+
+    return _call
+
+def build_rag_chain(args):
+    """Initialise the RAG retriever + chain."""
+    from rag.rag import get_retriever, get_retriever_from_db, create_rag_chain
+
+    if os.path.exists(args.faiss_db):
+        print(f"[RAG] Loading FAISS index from {args.faiss_db}")
+        from rag.rag import get_retriever_from_db
+        retriever = get_retriever_from_db(
+            args.faiss_db,
+            embedding_backend=args.emb_backend,
+            k=5,
+        )
+    else:
+        print("[RAG] Building FAISS index from docs cache…")
+        with open(args.docs_cache, "rb") as f:
+            docs = pickle.load(f)
+        from rag.rag import get_retriever
+        retriever = get_retriever(
+            docs,
+            args.faiss_db,
+            embedding_backend=args.emb_backend,
+            k=5,
+        )
+
+    # RAG chain uses its own internal LLM instantiation
+    from rag.rag import create_rag_chain
+    chain = create_rag_chain(
+        retriever,
+        llm_backend=args.llm_backend,
+        llm_model=args.llm_model,
+    )
+    return chain
+
+
+# ===========================================================================
+# Aggregation
+# ===========================================================================
+
+def aggregate(scored: List[Dict]) -> Dict[str, Dict[str, float]]:
+    """Group per-instance score dicts by system, return mean metrics."""
     grouped: Dict[str, List[Dict]] = defaultdict(list)
-    for sr in score_records:
-        grouped[sr["system"]].append(sr)
+    for s in scored:
+        grouped[s["system"]].append(s)
 
-    results: Dict[str, Dict[str, float]] = {}
-
-    for system, records in grouped.items():
+    results = {}
+    for system, recs in grouped.items():
         def _mean(key):
-            vals = [r[key] for r in records if key in r and not np.isnan(r[key])]
+            vals = [r[key] for r in recs if key in r and r[key] is not None
+                    and not (isinstance(r[key], float) and np.isnan(r[key]))]
             return float(np.mean(vals)) if vals else float("nan")
 
         def _p95(key):
-            vals = [r[key] for r in records if key in r and not np.isnan(r[key])]
+            vals = [r[key] for r in recs if key in r and r[key] is not None
+                    and not (isinstance(r[key], float) and np.isnan(r[key]))]
             return float(np.percentile(vals, 95)) if vals else float("nan")
 
         results[system] = {
-            "n":             len(records),
-            # Generative metrics (next_step subset)
-            "em":            _mean("em"),
-            "tok_f1":        _mean("tok_f1"),
-            "rouge_l":       _mean("rouge_l"),
-            "mrr":           _mean("mrr"),
-            # Counterfactual
-            "cf_acc":        _mean("cf_acc"),
-            # Graph fidelity
-            "pvr":           _mean("pvr"),
-            # Efficiency
-            "lat_mean_s":    _mean("elapsed_s"),
-            "lat_p95_s":     _p95("elapsed_s"),
+            "n":           len(recs),
+            "em":          _mean("em"),
+            "tok_f1":      _mean("tok_f1"),
+            "rouge_l":     _mean("rouge_l"),
+            "mrr":         _mean("mrr"),
+            "cf_acc":      _mean("cf_acc"),
+            "lat_mean_s":  _mean("answer_s"),
+            "lat_p95_s":   _p95("answer_s"),
         }
-
     return results
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Main evaluation loop
+# ===========================================================================
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Score GCR/RAG/GraphRAG predictions against gold annotations."
-    )
-    parser.add_argument("--predictions", default="eval/predictions.jsonl")
-    parser.add_argument("--graph",       default="test2.graphml",
-                        help="GraphML file for Path Validity Rate computation.")
-    parser.add_argument("--out-csv",     default="eval/results_table.csv")
-    parser.add_argument("--out-json",    default=None)
-    parser.add_argument("--no-pvr",      action="store_true",
-                        help="Skip Path Validity Rate (faster, no graph needed).")
-    args = parser.parse_args()
+def run_evaluation(args: argparse.Namespace) -> None:
+    os.makedirs(args.out_dir, exist_ok=True)
+    answers_path = os.path.join(args.out_dir, "answers.jsonl")
+    done = _load_done(answers_path)
 
-    # ---- Load predictions ----
-    records: List[Dict[str, Any]] = []
-    with open(args.predictions, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    print(f"Loaded {len(records)} prediction records.")
+    # ------------------------------------------------------------------ #
+    # Load dataset
+    # ------------------------------------------------------------------ #
+    print(f"Loading dataset: {args.dataset}")
+    questions = load_dataset(args.dataset)
+    if args.limit:
+        questions = questions[: args.limit]
+        print(f"  [--limit] Using first {args.limit} instances.")
 
-    # ---- Load graph ----
+    # Index by instance_id for fast lookup
+    q_index: Dict[str, Dict] = {q["instance_id"]: q for q in questions}
+    print(f"  {len(questions)} instances loaded.\n")
+
+    # ------------------------------------------------------------------ #
+    # Load predicted paths (GCR)
+    # ------------------------------------------------------------------ #
+    constrained_index:   Dict[str, Dict] = {}
+    unconstrained_index: Dict[str, Dict] = {}
+
+    if args.constrained_paths and os.path.exists(args.constrained_paths):
+        for rec in load_jsonl(args.constrained_paths):
+            constrained_index[rec["instance_id"]] = rec
+        print(f"Loaded {len(constrained_index)} constrained path records.")
+
+    if args.unconstrained_paths and os.path.exists(args.unconstrained_paths):
+        for rec in load_jsonl(args.unconstrained_paths):
+            unconstrained_index[rec["instance_id"]] = rec
+        print(f"Loaded {len(unconstrained_index)} unconstrained path records.\n")
+
+    # ------------------------------------------------------------------ #
+    # Load graph (GraphRAG needs it; GCR already used it in stage 1)
+    # ------------------------------------------------------------------ #
     graph = None
-    if not args.no_pvr:
+    if not args.skip_graphrag:
+        print(f"Loading context graph for GraphRAG: {args.graph_context}")
         from utils.graph_utils import load_graphml_to_networkx
-        print(f"Loading graph: {args.graph}")
-        graph = load_graphml_to_networkx(args.graph)
+        graph = load_graphml_to_networkx(args.graph_context)
 
-    # ---- Score each record ----
-    scored = []
-    for rec in records:
-        s = score_record(rec, graph, compute_pvr=(not args.no_pvr))
-        scored.append(s)
+    # ------------------------------------------------------------------ #
+    # Build LLMs (lazy — only load what we need)
+    # ------------------------------------------------------------------ #
+    llm          = None
+    rag_chain    = None
+    graphrag_llm = None
 
-    # ---- Aggregate ----
-    results = aggregate(scored)
+    systems_needed = []
+    if constrained_index:
+        systems_needed.append("gcr_constrained")
+    if unconstrained_index:
+        systems_needed.append("gcr_unconstrained")
+    if not args.skip_rag:
+        systems_needed.append("rag")
+    if not args.skip_graphrag:
+        systems_needed.append("graphrag")
 
-    # ---- Pretty-print ----
+    print(f"Systems to evaluate: {systems_needed}\n")
+
+    # ------------------------------------------------------------------ #
+    # Evaluation loop — one system at a time to keep memory predictable
+    # ------------------------------------------------------------------ #
+    all_scored: List[Dict] = []
+
+    for system in systems_needed:
+        print(f"=== {system.upper()} ===")
+
+        # --- lazy LLM init ---
+        if system in ("gcr_constrained", "gcr_unconstrained") and llm is None:
+            if args.llm_backend == "hf":
+                llm = build_llm_hf(args.llm_model, args.device, args.max_new_tokens)
+            elif args.llm_backend == "openai":
+                llm = build_llm_openai(args.llm_model, args.device, args.max_new_tokens)
+
+        if system == "rag" and rag_chain is None:
+            print("[RAG] Initializing retriever and chain…")
+            rag_chain = build_rag_chain(args)
+
+        if system == "graphrag" and graphrag_llm is None:
+            from graphrag.graphrag import build_graphrag_llm
+            if args.llm_backend == "hf":
+                graphrag_llm = build_graphrag_llm(
+                    backend="hf", model=args.llm_model,
+                    max_new_tokens=args.max_new_tokens,
+                )
+            elif args.llm_backend == "openai":
+                graphrag_llm = build_graphrag_llm(
+                    backend="openai", model=args.llm_model,
+                    max_new_tokens=args.max_new_tokens,
+                )
+
+        for q in tqdm(questions, desc=f"[{system}]"):
+            instance_id = q["instance_id"]
+
+            if (instance_id, system) in done:
+                continue
+
+            gold_answer    = q.get("gold_answer", "")
+            question_text  = q["question"]
+            question_family = q.get("question_family", "unknown")
+            anchor_oid     = q.get("anchor_object", {}).get("oid", "")
+
+            # --- generate answer ---
+            prediction = ""
+            answer_s   = float("nan")
+            beams: List[str] = []
+            extra: Dict = {}
+
+            print(f"\n[Instance {instance_id}] Question: {question_text}")
+
+            try:
+                if system == "gcr_constrained":
+                    path_rec = constrained_index.get(instance_id, {})
+                    beams = path_rec.get("paths", [])
+                    prediction, answer_s = generate_gcr_answer(
+                        path_rec, question_text, llm
+                    )
+                    extra = {
+                        "trie_build_s": path_rec.get("trie_build_s", 0.0),
+                        "generation_s": path_rec.get("generation_s", 0.0),
+                        "enrich_s":     path_rec.get("enrich_s", 0.0),
+                        "path_total_s": path_rec.get("total_s", 0.0),
+                    }
+
+                elif system == "gcr_unconstrained":
+                    path_rec = unconstrained_index.get(instance_id, {})
+                    beams = path_rec.get("paths", [])
+                    prediction, answer_s = generate_gcr_answer(
+                        path_rec, question_text, llm
+                    )
+                    extra = {
+                        "generation_s": path_rec.get("generation_s", 0.0),
+                        "path_total_s": path_rec.get("total_s", 0.0),
+                    }
+                elif system == "rag":
+                    print(f"\n[Instance {instance_id}] Generating RAG answer...", flush=True)
+                    prediction, answer_s = generate_rag_answer(
+                        question_text, rag_chain
+                    )
+                    beams = [prediction]
+
+                elif system == "graphrag":
+                    if anchor_oid and graph is not None:
+                        prediction, answer_s = generate_graphrag_answer(
+                            question_text, anchor_oid, graph, graphrag_llm
+                        )
+                    else:
+                        prediction = ""
+                        answer_s   = 0.0
+                    beams = [prediction]
+
+            except Exception as exc:
+                print(f"\n  [WARNING] {instance_id} / {system}: {exc}", flush=True)
+                prediction = ""
+                answer_s   = float("nan")
+
+            # --- score ---
+            metrics = score_answer(
+                prediction, gold_answer, question_family, beams
+            )
+
+            record = {
+                "instance_id":    instance_id,
+                "system":         system,
+                "question_family": question_family,
+                "question":       question_text,
+                "gold_answer":    gold_answer,
+                "prediction":     prediction,
+                "answer_s":       answer_s,
+                **metrics,
+                **extra,
+            }
+
+            _append(answers_path, record)
+            done.add((instance_id, system))
+            all_scored.append(record)
+
+    # ------------------------------------------------------------------ #
+    # Aggregate + report
+    # ------------------------------------------------------------------ #
+    # Load any previously written records not in this run's all_scored
+    all_written = load_jsonl(answers_path) if os.path.exists(answers_path) else []
+    results = aggregate(all_written)
+
+    METRICS = ["n", "em", "tok_f1", "rouge_l", "mrr", "cf_acc",
+               "lat_mean_s", "lat_p95_s"]
+
     print("\n========= RESULTS =========")
-    METRICS = ["n", "em", "tok_f1", "rouge_l", "mrr", "cf_acc", "pvr",
-                "lat_mean_s", "lat_p95_s"]
-    header = f"{'System':<12}" + "".join(f"{m:>12}" for m in METRICS)
+    header = f"{'System':<22}" + "".join(f"{m:>12}" for m in METRICS)
     print(header)
     print("-" * len(header))
     for sys_name, vals in sorted(results.items()):
-        row = f"{sys_name:<12}"
+        row = f"{sys_name:<22}"
         for m in METRICS:
             v = vals.get(m, float("nan"))
-            row += f"{v:>12.4f}" if not isinstance(v, int) else f"{v:>12d}"
+            if isinstance(v, int):
+                row += f"{v:>12d}"
+            else:
+                row += f"{v:>12.4f}"
         print(row)
 
-    # ---- Save CSV ----
+    # CSV + LaTeX
     try:
         import pandas as pd
-        df = pd.DataFrame(results).T.reset_index().rename(columns={"index": "system"})
-        df.to_csv(args.out_csv, index=False)
-        print(f"\nResults CSV → {args.out_csv}")
-
-        # LaTeX table for paper (include in appendix or results section)
-        latex_path = args.out_csv.replace(".csv", ".tex")
-        df_latex = df.copy()
-        # Round floats
-        float_cols = [c for c in df_latex.columns if c not in ("system", "n")]
-        df_latex[float_cols] = df_latex[float_cols].applymap(
-            lambda x: round(x, 4) if isinstance(x, float) else x
+        df = (
+            pd.DataFrame(results).T
+            .reset_index()
+            .rename(columns={"index": "system"})
         )
-        df_latex.to_latex(
-            latex_path, index=False, float_format="%.4f",
-            caption="Evaluation results on 100-instance P2P OCEL benchmark.",
+        csv_path = os.path.join(args.out_dir, "results_table.csv")
+        df.to_csv(csv_path, index=False)
+        print(f"\nCSV  → {csv_path}")
+
+        tex_path = os.path.join(args.out_dir, "results_table.tex")
+        float_cols = [c for c in df.columns if c not in ("system", "n")]
+        df[float_cols] = df[float_cols].map(
+            lambda x: round(float(x), 4) if pd.notnull(x) else x
+        )
+        df.to_latex(
+            tex_path,
+            index=False,
+            float_format="%.4f",
+            caption=(
+                "Evaluation results on 100-instance P2P OCEL benchmark. "
+                "EM = exact match, MRR = mean reciprocal rank (GCR beams), "
+                "CF-Acc = counterfactual accuracy, Lat = answer generation latency."
+            ),
             label="tab:results",
         )
-        print(f"LaTeX table → {latex_path}")
+        print(f"LaTeX → {tex_path}")
     except ImportError:
-        print("pandas not found — CSV/LaTeX output skipped.")
+        print("pandas not available — skipping CSV/LaTeX output.")
 
-    # ---- Save full JSON ----
-    if args.out_json:
-        with open(args.out_json, "w", encoding="utf-8") as f:
-            json.dump({"aggregated": results, "per_instance": scored},
-                      f, indent=2, default=str)
-        print(f"Full JSON → {args.out_json}")
+    print(f"\nAll answers → {answers_path}")
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=(
+            "Stage 2: generate final answers from GCR paths / RAG / GraphRAG "
+            "and score them against gold annotations."
+        )
+    )
+    # ---- inputs ----
+    p.add_argument("--dataset", required=True,
+                   help="Evaluation sample JSON/JSONL.")
+    p.add_argument("--constrained_paths", default=None,
+                   help="JSONL from generate_predicted_paths.py (constrained).")
+    p.add_argument("--unconstrained_paths", default=None,
+                   help="JSONL from generate_predicted_paths.py (unconstrained).")
+    p.add_argument("--graph_context", default=None,
+                   help="Context graph GraphML (required for GraphRAG).")
+    p.add_argument("--faiss_db", default="./faiss_db_bge",
+                   help="FAISS index directory (for RAG).")
+    p.add_argument("--docs_cache", default="cache/pm4py_docs.pkl",
+                   help="Pickled LangChain docs (used to build FAISS if index absent).")
+    # ---- model ----
+    p.add_argument("--llm_model", default="Qwen/Qwen2.5-7B-Instruct",
+                   help="HuggingFace model for answer generation.")
+    p.add_argument("--llm_backend", default="openai",
+                   choices=["hf", "openai"],
+                   help="LLM backend for answer generation.")
+    p.add_argument("--emb_backend", default="bge",
+                   choices=["openai", "bge", "minilm", "e5"],
+                   help="Embedding backend for RAG retriever.")
+    p.add_argument("--device", default="cpu",
+                   choices=["cpu", "cuda", "mps"])
+    p.add_argument("--max_new_tokens", type=int, default=256)
+    # ---- output ----
+    p.add_argument("--out_dir", default="results",
+                   help="Directory for answers.jsonl and results_table.*")
+    # ---- control ----
+    p.add_argument("--limit", type=int, default=None,
+                   help="Evaluate only the first N instances (testing).")
+    p.add_argument("--skip_rag", action="store_true",
+                   help="Skip RAG system.")
+    p.add_argument("--skip_graphrag", action="store_true",
+                   help="Skip GraphRAG system.")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    run_evaluation(parse_args())

@@ -125,27 +125,78 @@ def build_events_dict(ocel) -> Dict[str, Event]:
         events[eid] = Event(
             eid=eid,
             activity=activity,
-            timestamp=str(row["ocel:timestamp"]),
             objects=event_objects.get(eid, set()),
             object_types=event_object_types.get(eid, set()),
         )
 
     return events
 
+def reify_generated_path(self, generated_string, anchor_object, G_context):
+    # 1. Robust Normalization (Lowercasing is key)
+    activity_names = [
+        s.replace("Event:", "").replace("_", " ").strip().lower() 
+        for s in generated_string.split()
+    ]
+    
+    if anchor_object not in G_context:
+        return [None] * len(activity_names)
+
+    # 2. Track "Active" Objects (Start with anchor, expand as we find events)
+    active_objects = {anchor_object}
+    reified_path = []
+    used_eids = set()
+
+    for act_name in activity_names:
+        matched_event = None
+        
+        # Search neighbors of ALL currently active objects
+        for obj in active_objects:
+            candidate_neighbors = G_context.neighbors(obj)
+            
+            # Sort neighbors by timestamp to stay process-aware
+            candidates = []
+            for nbr in candidate_neighbors:
+                node = G_context.nodes[nbr]
+                if node.get("entity_type") == "Event" and nbr not in used_eids:
+                    candidates.append((nbr, node))
+            
+            # Sort by timestamp (handling None safely)
+            candidates.sort(key=lambda x: str(x[1].get("timestamp") or "0000"))
+
+            for eid, node in candidates:
+                # Case-insensitive matching
+                if node.get("activity", "").lower() == act_name:
+                    matched_event = self.events.get(eid)
+                    used_eids.add(eid)
+                    
+                    # OBJECT HOP: Add all objects involved in THIS event to active_objects
+                    # This allows the next activity to be found via a related object
+                    if matched_event:
+                        active_objects.update(matched_event.objects)
+                    break
+            
+            if matched_event:
+                break
+        
+        reified_path.append(matched_event)
+        if not matched_event:
+             print(f" [DEBUG] Failed to match: {act_name} among neighbors of {active_objects}")
+                
+    return reified_path
 
 def enrich_paths_with_context(
     paths: List[List["Event"]],
     anchor_object: str,
-    G_context: nx.MultiDiGraph,
-    max_neighbors: int = 5,
+    G_context: nx.DiGraph,
+    max_depth: int = 5,
 ) -> str:
     """
-    Enriches process paths with a 'Capped' context to prevent token explosion.
-    - Caps object-to-object relations at max_neighbors.
-    - Deduplicates redundant relations.
-    - Includes all attributes (Whitelisting Removed).
+    Enriches paths with focused context. 
+    - Inline relations are restricted to objects present in the same step.
+    - Broad neighbor context and attributes are moved to a single 'Object details' footer.
     """
     _SKIP_ATTRS = {"entity_type", "object_type"}
+    MAX_NEIGHBORS = 5  # Cap to prevent token bloat
 
     def _obj_type(oid: str) -> str:
         if oid not in G_context.nodes:
@@ -153,41 +204,48 @@ def enrich_paths_with_context(
         return G_context.nodes[oid].get("object_type", "object")
 
     def _obj_attrs(oid: str) -> dict:
-        """Returns all attributes except bookkeeping keys and empty values."""
         if oid not in G_context.nodes:
             return {}
-        node_data = G_context.nodes[oid]
-        
         return {
-            k.replace("ocel:", ""): v for k, v in node_data.items()
-            if k not in _SKIP_ATTRS 
-            and not k.startswith("ocel:") # Keep cleaning OCEL internal prefixes
+            k.replace("ocel:", ""): v for k, v in G_context.nodes[oid].items()
+            if k not in _SKIP_ATTRS
+            and not k.startswith("ocel:")
             and str(v).lower() not in ("", "nan", "none")
         }
 
-    def _o2o_relations(oid: str, limit: int) -> List[Tuple[str, str]]:
-        """Finds unique Object-to-Object relations up to a specified limit."""
+    def _get_focused_relations(oid: str, step_objs: Set[str]) -> List[Tuple[str, str]]:
+        """Only returns relations to other objects involved in the CURRENT step."""
         if oid not in G_context.nodes:
             return []
-        
         rels = []
         seen = set()
-        
-        # Check both directions for structural context
+        # Check edges to see if any neighbor is also in this step
         edges = list(G_context.out_edges(oid, data=True)) + list(G_context.in_edges(oid, data=True))
-        
         for u, v, data in edges:
-            neighbor = v if u == oid else u
-            
-            if G_context.nodes.get(neighbor, {}).get("entity_type") == "Object":
-                label = data.get("label", data.get("qualifier", "related_to"))
-                
-                if (neighbor, label) not in seen:
-                    rels.append((neighbor, label))
-                    seen.add((neighbor, label))
-                    
-                if len(rels) >= limit:
-                    break
+            nbr = v if u == oid else u
+            if nbr in step_objs and nbr != oid:
+                label = data.get("label", data.get("edge_type", "related_to"))
+                if (nbr, label) not in seen:
+                    rels.append((nbr, label))
+                    seen.add((nbr, label))
+        return rels
+
+    def _get_all_neighbors(oid: str, limit: int = 5) -> List[Tuple[str, str]]:
+        """Returns a capped list of all unique object neighbors for the footer."""
+        if oid not in G_context.nodes:
+            return []
+        rels = []
+        seen = set()
+        edges = list(G_context.out_edges(oid, data=True)) + list(G_context.in_edges(oid, data=True))
+        for u, v, data in edges:
+            nbr = v if u == oid else u
+            if G_context.nodes.get(nbr, {}).get("entity_type") == "Object" and nbr != oid:
+                label = data.get("label", data.get("edge_type", "related_to"))
+                if (nbr, label) not in seen:
+                    rels.append((nbr, label))
+                    seen.add((nbr, label))
+            if len(rels) >= limit:
+                break
         return rels
 
     lines: List[str] = []
@@ -198,28 +256,35 @@ def enrich_paths_with_context(
     lines.append("")
 
     for path_idx, path in enumerate(paths, start=1):
-        lines.append(f"Path {path_idx}: {' → '.join(e.activity for e in path)}")
+        lines.append(f"Path {path_idx}: {' → '.join(e.activity for e in path if e)}")
 
         for step_idx, event in enumerate(path, start=1):
+            if not event: continue
             lines.append(f"  Step {step_idx} — {event.activity}")
 
-            step_objs = sorted(list(event.objects))
+            step_objs = set(event.objects)
             if step_objs:
-                lines.append(f"    Objects involved: {', '.join(step_objs)}")
+                lines.append(f"    Objects involved: {', '.join(sorted(step_objs))}")
             
             for oid in step_objs:
-                o2o = _o2o_relations(oid, limit=max_neighbors)
-                if o2o:
-                    rel_str = ", ".join(f"{nbr} [{lbl}]" for nbr, lbl in o2o)
-                    lines.append(f"      {oid} → related to: {rel_str}")
+                # 1. Inline: Only show relations to other objects in this specific event
+                step_rels = _get_focused_relations(oid, step_objs)
+                if step_rels:
+                    rel_str = ", ".join(f"{nbr} [{lbl}]" for nbr, lbl in step_rels)
+                    lines.append(f"      {oid} → connected to: {rel_str}")
                 
+                # 2. Detail Collection: Only add to footer once
                 if oid not in seen_objects:
                     seen_objects.add(oid)
                     attrs = _obj_attrs(oid)
+                    all_nbrs = _get_all_neighbors(oid, limit=max_depth)
+                    
                     detail = f"  {oid} (type: {_obj_type(oid)})"
                     if attrs:
-                        # Now processes all attributes found in the node
                         detail += "\n    Attributes: " + ", ".join(f"{k}={v}" for k, v in attrs.items())
+                    if all_nbrs:
+                        nbr_str = ", ".join(f"{nbr} [{lbl}]" for nbr, lbl in all_nbrs)
+                        detail += f"\n    General Relations: {nbr_str}"
                     object_detail_lines.append(detail)
 
         lines.append("")
