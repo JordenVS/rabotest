@@ -8,6 +8,8 @@ faiss_db*/
 .python-version
 claude/
 test.*
-results*/
+results/
+results_mini*
+results_d*/
 eval/data
 paths_*
