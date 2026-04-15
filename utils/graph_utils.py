@@ -3,7 +3,7 @@ import pandas as pd
 import pm4py
 import pickle
 from collections import deque, defaultdict
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Set, Tuple
 
 
 def ocel_to_graph_with_pm4py(input_file_path, output_file_path) -> nx.DiGraph:
@@ -330,3 +330,99 @@ def enumerate_paths_unconstrained(
             break
 
     return paths
+
+def linearize_path(
+    path: List[Tuple[str, str, str]],
+    graph: nx.DiGraph,
+    sep: str = " ",
+) -> str:
+    """
+    Convert a list of (node, rel, nxt) triples into a chain string:
+
+        label(n0) rel_01 label(n1) rel_12 label(n2) ...
+
+    Interior nodes are emitted exactly once.  For an empty path, returns "".
+
+    Parameters
+    ----------
+    path  : List of (src_id, relation_label, tgt_id) triples produced by
+            extract_paths().  The relation label is already underscore-normalised
+            by extract_paths().
+    graph : The NetworkX DiGraph (needed to look up node attributes).
+    sep   : Token separator (default single space, matching tokenizer default).
+    """
+    parts = []
+    for i, (node, rel, nxt) in enumerate(path):
+        node_type = graph.nodes[node].get("entity_type", "Node")
+        node_label = graph.nodes[node].get("activity", graph.nodes[node].get("object_type", node))
+        node_label = node_label.replace(" ", "_")  
+        parts.append(f"{node_type}:{node_label}")
+        parts.append(rel)
+        if i == len(path) - 1:  # append final node only once
+            nxt_type = graph.nodes[nxt].get("entity_type", "Node")
+            nxt_label = graph.nodes[nxt].get("activity", graph.nodes[nxt].get("object_type", nxt))
+            nxt_label = nxt_label.replace(" ", "_")
+            parts.append(f"{nxt_type}:{nxt_label}")
+    return sep.join(parts)
+
+# ---------------------------------------------------------------------------
+# Path extraction
+# ---------------------------------------------------------------------------
+
+def extract_paths(
+    G: nx.DiGraph,
+    start_node: str,
+    max_depth: int = 6,
+) -> List[List[Tuple[str, str, str]]]:
+    """
+    DFS enumeration of all simple paths starting from *start_node* up to
+    *max_depth* hops.  Cycles are broken by per-path visited sets.
+
+    Returns a list of paths, each path being a list of (src, rel, tgt) triples.
+    Relation labels have spaces normalised to underscores.
+    """
+    paths: List[List[Tuple[str, str, str]]] = []
+    stack = [(start_node, [], 0, {start_node})]
+
+    while stack:
+        node, cur, d, visited = stack.pop()
+        if d >= max_depth or G.out_degree(node) == 0:
+            if cur:
+                paths.append(cur)
+            continue
+        for _, nxt, data in G.out_edges(node, data=True):
+            rel = str(data.get("label", "rel")).replace(" ", "_")
+            if nxt in visited:
+                if cur:
+                    paths.append(cur)   # terminate on cycle, keep partial path
+                continue
+            stack.append((nxt, cur + [(node, rel, nxt)], d + 1, visited | {nxt}))
+
+    return paths
+
+
+# ---------------------------------------------------------------------------
+# Bulk path-string collection (used by GCRProcessAgent)
+# ---------------------------------------------------------------------------
+
+def collect_unique_path_strings(
+    G: nx.DiGraph,
+    start_nodes: List[str],
+    max_depth: int = 3,
+) -> List[str]:
+    """
+    Enumerate and deduplicate chain-format path strings across all *start_nodes*.
+
+    Returns
+    -------
+    List[str]  — unique linearised path strings, each in canonical format.
+    """
+    seen: set = set()
+    results: List[str] = []
+    for s in start_nodes:
+        for trip_path in extract_paths(G, s, max_depth=max_depth):
+            s_line = linearize_path(trip_path, G)
+            if s_line and s_line not in seen:
+                seen.add(s_line)
+                results.append(s_line)
+    return results

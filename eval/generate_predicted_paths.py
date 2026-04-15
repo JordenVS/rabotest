@@ -1,53 +1,77 @@
 """
 eval/generate_predicted_paths.py
-==================================
-Runs the small path-generation LLM over the evaluation dataset to produce
-the predicted-paths JSONL files required by run_evaluation.py.
+=================================
+Stage 1 of the two-stage GCR evaluation pipeline.
 
-Two files are written:
+Runs the path-generation LLM under graph-constrained decoding (Luo et al., 2025)
+over the evaluation sample and writes two JSONL files:
+
     <out_dir>/predicted_paths_constrained.jsonl
-    <out_dir>/predicted_paths_unconstrained.jsonl
+    <out_dir>/predicted_paths_unconstrained.jsonl   (unless --skip_unconstrained)
 
-Each file has one record per question:
-    {"id": "T1_001", "paths": ["Event:Create_Purchase_Order NEXT_FOR_po ..."]}
+Architecture
+------------
+Two graphs serve distinct roles:
 
-These files are then passed to run_evaluation.py via:
-    --constrained_paths   <out_dir>/predicted_paths_constrained.jsonl
-    --unconstrained_paths <out_dir>/predicted_paths_unconstrained.jsonl
+  G_context  — heterogeneous graph (Event + Object nodes, participation edges).
+               ``build_events_dict_from_context_graph`` reads this to reconstruct
+               which objects each event involves, without reloading the raw OCEL file.
 
-The path-generation LLM (small, e.g. Qwen2.5-1.5B-Instruct) is intentionally
-separate from the answer-generation LLM (large, e.g. Qwen2.5-7B-Instruct) so
-that the two-stage pipeline mirrors the intended GCR architecture: constrained
-decoding over a small model produces structured process paths, which are then
-used as grounded context for a larger model to generate natural language answers.
+  G_behavior — event-only graph (Event nodes, behavior edges encoding process sequences).
+               ``build_event_successors_from_g_behavior`` reads this to derive which
+               events can legally follow a given event, forming the basis of the
+               ProcessTrie used to constrain decoding.
+
+Together they allow ``GCRProcessAgent`` to enumerate only behaviorally valid paths
+that remain anchored to the objects of the query entity, producing zero-hallucination
+reasoning paths as described in Luo et al. (2025).
+
+Output schema (one JSON object per line)
+-----------------------------------------
+{
+  "id":            "Q007",
+  "paths":         ["Event:Create_Purchase_Order Event:Approve_Purchase_Order ..."],
+  "trie_build_s":  0.12,
+  "generation_s":  1.45,
+  "total_s":       1.57,
+  "note":          ""      # non-empty only on error / skip
+}
 
 Usage
 -----
     python -m eval.generate_predicted_paths \\
-        --dataset  eval/data/eval_combined.jsonl \\
-        --graphml  test2.graphml \\
-        --model    Qwen/Qwen2.5-1.5B-Instruct \\
-        --out_dir  results \\
-        --num_paths 3 \\
-        --max_depth 4
+        --dataset         eval/sampled_100.json \\
+        --graph_context   context_graph.graphml \\
+        --graph_behavior  behavior_graph.graphml \\
+        --model           Qwen/Qwen2.5-1.5B-Instruct \\
+        --out_dir         results \\
+        --num_paths       3 \\
+        --max_depth       4
 
-    For quick testing:
+        python -m eval.generate_predicted_paths --dataset eval/data/sampled_100.json --graph_context graphs/context_graph.graphml --graph_behavior graphs/behavior_graph.graphml --model Qwen/Qwen2.5-1.5B-Instruct --out_dir paths_new_d3 --num_paths 3 --max_depth 3 --limit 5
+    Quick test (5 questions only):
         --limit 5
+
+References
+----------
+Luo, L., Zhao, Z., Haffari, G., Li, Y.-F., Gong, C., & Pan, S. (2025).
+    Graph-constrained reasoning: Faithful reasoning on knowledge graphs with
+    large language models. ICML 2025.
 """
 
 from __future__ import annotations
 
 import argparse
-import pickle
 import json
 import os
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List
+import networkx as nx
 
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
-# Resolve project root so imports work regardless of cwd
+# Project root resolution (works regardless of working directory)
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -55,121 +79,125 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from utils.graph_utils import load_graphml_to_networkx
-#from gcr.processors import GCRProcessAgent
-from gcr.processors2 import GCRProcessAgent, DualGCRProcessAgent
+from gcr.gcr import build_events_dict_from_context_graph, build_event_successors_from_g_behavior
+from gcr.processors import GCRProcessAgent
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# I/O helpers
 # ---------------------------------------------------------------------------
 
-def load_jsonl(path: str) -> List[Dict]:
-    with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+def load_dataset(path: str) -> List[Dict]:
+    """Load the evaluation sample — accepts both a JSON array and JSONL."""
+    with open(path, encoding="utf-8") as f:
+        content = f.read().strip()
+    if content.startswith("["):
+        return json.loads(content)
+    return [json.loads(line) for line in content.splitlines() if line.strip()]
 
 
-def save_jsonl(records: List[Dict], path: str) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
-        for r in records:
-            f.write(json.dumps(r) + "\n")
-    print(f"  Saved {len(records)} records → {path}")
+def _load_done_ids(path: str) -> set:
+    """Return the set of instance_ids already written to *path* (for resume support)."""
+    done: set = set()
+    if not os.path.exists(path):
+        return done
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                done.add(json.loads(line)["instance_id"])
+            except (json.JSONDecodeError, KeyError):
+                pass
+    return done
+
+
+def _skip_record(instance_id: str, reason: str) -> Dict:
+    return {
+        "instance_id":   instance_id,
+        "paths":         [],
+        "trie_build_s":  0.0,
+        "generation_s":  0.0,
+        "total_s":       0.0,
+        "prompt_tokens": 0,
+        "note":          reason,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Path generation
+# Core generation loop
 # ---------------------------------------------------------------------------
 
 def generate_paths(
     questions: List[Dict],
     agent: GCRProcessAgent,
-    dualagent: DualGCRProcessAgent,
+    *,
     constrained: bool,
+    enrich: bool,
+    G_context: nx.DiGraph,
     num_paths: int,
     max_depth: int,
-) -> Tuple[List[Dict], List[Dict]]:
+    out_path: str,
+) -> None:
     """
-    Run the agent over all questions and return a list of
-    {"id": ..., "paths": [...], "trie_build_s": ..., "generation_s": ...} records.
+    Run *agent* over *questions* and write one record per question to *out_path*.
 
-    The seed entity for path generation is always topic_entities[0], matching
-    the convention used in run_evaluation.py.  Questions with no topic entity
-    are skipped and recorded with an empty path list.
+    The file is opened in append mode so an interrupted run can be resumed:
+    questions whose instance_id is already present in *out_path* are skipped.
+
+    The anchor object is read from ``anchor_object.oid``, matching the
+    dataset schema produced by build_evaluation_dataset().
+
+    Parameters
+    ----------
+    constrained:
+        True  → graph-constrained beam search (GCR proper).
+        False → unconstrained beam search (ablation baseline;
+                 'GCR w/o constraint' in Luo et al., 2025, Fig. 5).
     """
-    mode = "constrained" if constrained else "unconstrained"
-    records_local: List[Dict] = []
-    records_global: List[Dict] = []
+    label = "constrained" if constrained else "unconstrained"
+    # done = _load_done_ids(out_path)
 
-    for q in tqdm(questions, desc=f"Generating {mode} paths"):
-        topic_entities = q.get("topic_entities", [])
-        seed_entity = topic_entities[0] if topic_entities else None
+    # skipped = sum(1 for q in questions if q.get("instance_id") in done)
+    # if skipped:
+    #     print(f"  [{label}] Resuming — skipping {skipped} already-completed questions.")
 
-        if seed_entity is None or seed_entity not in agent.graph:
-            records_local.append({
-                "id": q["id"],
-                "paths": [],
-                "trie_build_s": 0.0,
-                "generation_s": 0.0,
-                "total_s": 0.0,
-                "prompt_tokens": 0,
-                "note": "seed entity missing or not in graph",
-            })
-            continue
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
-        try:
-            timing = agent.timed_generate(
-                seed_entity=seed_entity,
-                question=q["question"],
-                constrained=constrained,
-                num_paths=num_paths,
-                max_depth=max_depth,
-            )
-            records_local.append({
-                "id": q["id"],
-                "paths": timing.pop("paths"),
-                **timing,
-            })
-        except Exception as e:
-            print(f"\n  [WARNING] {q['id']} ({seed_entity}) failed: {e}")
-            records_local.append({
-                "id": q["id"],
-                "paths": [],
-                "trie_build_s": 0.0,
-                "generation_s": 0.0,
-                "total_s": 0.0,
-                "prompt_tokens": 0,
-                "note": f"error: {e}",
-            })
+    with open(out_path, "w", encoding="utf-8") as f_out:
+        for q in tqdm(questions, desc=f"[{label}]"):
+            instance_id = q.get("instance_id", "???")
 
-        if constrained:
-            try:
-                timing = dualagent.timed_generate(
-                    seed_entity=seed_entity,
-                    question=q["question"],
-                    num_paths=num_paths,
-                    max_depth=max_depth,
-                )
-                records_global.append({
-                    "id": q["id"],
-                    "local_paths": timing.pop("local_paths"),
-                    "global_paths": timing.pop("global_paths"),
-                    **timing,
-                })
-            except Exception as e:
-                print(f"\n  [WARNING] {q['id']} ({seed_entity}) failed: {e}")
-                records_global.append({
-                    "id": q["id"],
-                    "local_paths": [],
-                    "global_paths": [],
-                    "trie_build_s": 0.0,
-                    "generation_s": 0.0,
-                    "total_s": 0.0,
-                    "prompt_tokens": 0,
-                    "note": f"error: {e}",
-                })
+            # if instance_id in done:
+            #     continue
 
+            anchor = q.get("anchor_object", {}).get("oid")
 
-    return records_local, records_global
+            if not anchor:
+                rec = _skip_record(instance_id, "anchor_object.oid missing")
+            else:
+                try:
+                    timing = agent.timed_generate(
+                        anchor_object=anchor,
+                        question=q["question"],
+                        constrained=constrained,
+                        enrich=enrich,
+                        G_context=G_context,
+                        num_paths=num_paths,
+                        max_depth=max_depth,
+                    )
+                    rec = {
+                        "instance_id": instance_id,
+                        "paths":       timing.pop("paths"),
+                        "note":        "",
+                        **timing,
+                    }
+                except Exception as exc:
+                    print(f"\n  [WARNING] {instance_id} ({anchor}): {exc}")
+                    rec = _skip_record(instance_id, f"error: {exc}")
+
+            f_out.write(json.dumps(rec, default=str) + "\n")
+            f_out.flush()
+
+    print(f"  → {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -178,47 +206,61 @@ def generate_paths(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Generate constrained and unconstrained predicted-path files for GCR evaluation."
+        description=(
+            "Stage 1: generate GCR reasoning-path predictions "
+            "(constrained + unconstrained ablation) over the evaluation sample."
+        )
     )
     p.add_argument(
         "--dataset", required=True,
-        help="Path to the combined evaluation JSONL (e.g. eval/data/eval_combined.jsonl)"
+        help="Evaluation sample — JSON array or JSONL (e.g. eval/sampled_100.json)"
     )
     p.add_argument(
-        "--graph_local", required=True,
-        help="Path to the OCEL process graph (e.g. test2.graphml)"
+        "--graph_context", required=True,
+        help=(
+            "Context graph GraphML (Event + Object nodes, participation edges). "
+            "Used to reconstruct event-object memberships."
+        )
     )
     p.add_argument(
-        "--graph_global",
-        help="Path to the pickled graph (e.g. global_graph.pkl)"
+        "--graph_behavior", required=True,
+        help=(
+            "Behavior graph GraphML (Event nodes only, behavior edges). "
+            "Used to derive valid event successors for trie construction."
+        )
     )
     p.add_argument(
         "--model", default="Qwen/Qwen2.5-1.5B-Instruct",
-        help="HuggingFace model ID for the small path-generation LLM"
+        help="HuggingFace model ID for the path-generation LLM"
     )
     p.add_argument(
         "--device", default="cpu",
-        help="Device for the path-generation model ('cpu', 'cuda', 'mps')"
+        choices=["cpu", "cuda", "mps"],
+        help="Torch device"
     )
     p.add_argument(
         "--num_paths", type=int, default=3,
-        help="Number of beam paths to generate per question (num_beams)"
+        help="Number of beam paths per question (num_beams in beam search)"
     )
     p.add_argument(
         "--max_depth", type=int, default=4,
-        help="Maximum trie depth / path hops"
+        help="Maximum path depth / trie hops"
     )
     p.add_argument(
         "--out_dir", default="results",
-        help="Directory where the two predicted-paths JSONL files are written"
+        help="Output directory for the predicted-path JSONL files"
     )
     p.add_argument(
         "--limit", type=int, default=None,
-        help="Limit number of questions (useful for quick testing)"
+        help="Use only the first N questions — useful for quick testing"
+    )
+    p.add_argument(
+        "--skip_enrich", action="store_true",
+        help="Skip the enriched GCR variant (grounded object context)"
     )
     p.add_argument(
         "--skip_unconstrained", action="store_true",
-        help="Only generate the constrained file (saves time if ablation not needed)"
+        help="Skip the unconstrained ablation run (saves time)"
     )
     return p.parse_args()
 
@@ -226,60 +268,79 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # Load graph
-    print(f"Loading graph: {args.graph_local}")
-    G_local = load_graphml_to_networkx(args.graph_local)
+    # ------------------------------------------------------------------ #
+    # 1. Load graphs
+    # ------------------------------------------------------------------ #
+    print(f"Loading context graph:  {args.graph_context}")
+    G_context = load_graphml_to_networkx(args.graph_context)
 
-    if args.graph_global:
-        print(f"Loading graph: {args.graph_global}")
-        with open(args.graph_global, "rb") as f:
-            G_global = pickle.load(f)
+    print(f"Loading behavior graph: {args.graph_behavior}")
+    G_behavior = load_graphml_to_networkx(args.graph_behavior)
 
-    # Load dataset
-    questions = load_jsonl(args.dataset)
+    # ------------------------------------------------------------------ #
+    # 2. Load evaluation sample
+    # ------------------------------------------------------------------ #
+    questions = load_dataset(args.dataset)
     if args.limit:
-        questions = questions[:args.limit]
-    print(f"Loaded {len(questions)} questions from {args.dataset}.")
+        questions = questions[: args.limit]
+        print(f"[--limit] Using first {args.limit} questions.")
+    print(f"Loaded {len(questions)} questions from {args.dataset}.\n")
 
-    # Load agent once — shared for both runs
+    # ------------------------------------------------------------------ #
+    # 3. Build GCR agent
+    #    The model is loaded once and reused for both the constrained and
+    #    unconstrained runs to avoid double-loading weights.
+    # ------------------------------------------------------------------ #
+    print("Building events dict from context graph…")
+    events = build_events_dict_from_context_graph(G_context)
+    print(f"  {len(events)} events loaded.")
+
+    print("Building event successors from behavior graph…")
+    event_successors = build_event_successors_from_g_behavior(G_behavior, events)
+    print(f"  {len(event_successors)} events have successors.")
+
     print(f"Loading path-generation model: {args.model}")
-    agent = GCRProcessAgent(args.model, G_local, device=args.device)
-    print("  Agent ready.\n")
-    dual_agent = DualGCRProcessAgent(args.model, G_local=G_local, G_global=G_global, device=args.device)
-    print("  Dual Agent ready.\n")
+    agent = GCRProcessAgent(
+        model_id=args.model,
+        events=events,
+        event_successors=event_successors,
+        device=args.device,
+    )
+    print("Agent ready.\n")
 
-    #--- Constrained ---
-    print("--- Generating CONSTRAINED paths local ---")
-    constrained_records_local, constrained_records_global= generate_paths(
-        questions, agent, dual_agent,
+    # ------------------------------------------------------------------ #
+    # 4. Constrained run (GCR proper)
+    # ------------------------------------------------------------------ #
+    print("=== Constrained (GCR) ===")
+    generate_paths(
+        questions, agent,
         constrained=True,
+        enrich=not args.skip_enrich,
+        G_context=G_context,
         num_paths=args.num_paths,
         max_depth=args.max_depth,
-    )
-    save_jsonl(
-        constrained_records_local,
-        os.path.join(args.out_dir, "predicted_paths_constrained_local.jsonl"),
-    )
-    save_jsonl(
-        constrained_records_global,
-        os.path.join(args.out_dir, "predicted_paths_constrained_global.jsonl"),
+        out_path=os.path.join(args.out_dir, "predicted_paths_constrained.jsonl"),
     )
 
-    # --- Unconstrained ---
+    # ------------------------------------------------------------------ #
+    # 5. Unconstrained ablation
+    # ------------------------------------------------------------------ #
     if not args.skip_unconstrained:
-        print("\n--- Generating UNCONSTRAINED paths ---")
-        unconstrained_records_local, unconstrained_records_global = generate_paths(
-            questions, agent, dual_agent,
+        print("\n=== Unconstrained (ablation baseline) ===")
+        generate_paths(
+            questions, agent,
             constrained=False,
+            enrich=False,
+            G_context=G_context,
             num_paths=args.num_paths,
             max_depth=args.max_depth,
-        )
-        save_jsonl(
-            unconstrained_records_local,
-            os.path.join(args.out_dir, "predicted_paths_unconstrained_local.jsonl"),
+            out_path=os.path.join(args.out_dir, "predicted_paths_unconstrained.jsonl"),
         )
 
-    print("\nDone. Pass the output files to run_evaluation.py:")
+    # ------------------------------------------------------------------ #
+    # 6. Summary
+    # ------------------------------------------------------------------ #
+    print("\n=== Done. Pass these files to run_evaluation.py: ===")
     print(f"  --constrained_paths   {args.out_dir}/predicted_paths_constrained.jsonl")
     if not args.skip_unconstrained:
         print(f"  --unconstrained_paths {args.out_dir}/predicted_paths_unconstrained.jsonl")

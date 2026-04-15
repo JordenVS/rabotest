@@ -3,12 +3,13 @@
 __pycache__/
 __init__.py
 *.graphml
-data/
 faiss_db*/
-cache/
 .DS_Store
 .python-version
 claude/
-*.pkl
 test.*
-results*/
+results/
+results_mini*
+results_d*/
+eval/data
+paths_*

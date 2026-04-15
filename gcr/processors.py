@@ -1,62 +1,24 @@
-"""
-gcr/processors.py
------------------
-GCR logits processor and high-level agent for OCEL 2.0 process graphs.
-
-"""
-
 import time
-import torch
 import networkx as nx
+import torch
+from typing import List, Dict, Optional, Tuple
 from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList
-from typing import List
 
-# Internal imports — only functions that actually exist in gcr.gcr
-from .gcr import collect_unique_path_strings, build_trie_from_path_strings
-
-
-# ---------------------------------------------------------------------------
-# 1.  CONSTRAINED LOGITS PROCESSOR  (GCR core)
-# ---------------------------------------------------------------------------
+from .trie import ProcessTrie
+from .gcr import enumerate_object_valid_paths, linearize_event_path, enrich_paths_with_context, reify_generated_path
 
 class GCRProcessProcessor(torch.nn.Module):
     """
-    Masks the LLM vocabulary at every decoding step so that only token
-    continuations that form valid paths in the OCEL graph's ProcessTrie
-    are allowed.  This is the direct adaptation of the KG-Trie constrained
-    decoding described in Luo et al. (2024).
-
-    Parameters
-    ----------
-    trie : ProcessTrie
-        Trie built from the graph paths rooted at the seed entity.
-    prompt_lens : List[int]
-        Length (in tokens) of each prompt in the batch *before* generation
-        starts.  Used to strip the prompt prefix when querying the trie.
-    tokenizer : PreTrainedTokenizer
-        The same tokenizer used to build the trie and encode the prompt.
+    Trie-based constrained decoding for GCR path generation.
     """
 
-    def __init__(self, trie, prompt_lens: List[int], tokenizer, edge_boost: float = 2.0):
+    def __init__(self, trie: ProcessTrie, prompt_lens: List[int], tokenizer):
         super().__init__()
         self.trie = trie
         self.prompt_lens = prompt_lens
-        self.tokenizer = tokenizer
         self.eos_token_id = tokenizer.eos_token_id
-        # correct
-        self.next_for_token_ids = {
-            tid for tok, tid in tokenizer.get_vocab().items()
-            if "NEXT_FOR" in tok
-        }
-        self.edge_boost = edge_boost
 
-
-    def __call__(
-        self,
-        input_ids: torch.LongTensor,
-        scores: torch.FloatTensor,
-    ) -> torch.FloatTensor:
-
+    def __call__(self, input_ids, scores):
         batch_size = input_ids.shape[0]
         num_prompts = len(self.prompt_lens)
         beam_width = max(1, batch_size // num_prompts)
@@ -65,226 +27,291 @@ class GCRProcessProcessor(torch.nn.Module):
             prompt_idx = min(b // beam_width, num_prompts - 1)
             p_len = self.prompt_lens[prompt_idx]
 
-            current_gen_ids = input_ids[b][p_len:].tolist()
-            allowed = self.trie.allowed_next(current_gen_ids)
+            generated = input_ids[b][p_len:].tolist()
+            allowed = self.trie.allowed_next(generated)
 
             mask = torch.full_like(scores[b], float("-inf"))
 
             if allowed:
-                allowed_tensor = torch.tensor(
-                    list(allowed), dtype=torch.long, device=scores.device
-                )
-                vocab_size = scores.shape[-1]
-                allowed_tensor = allowed_tensor[
-                    (allowed_tensor >= 0) & (allowed_tensor < vocab_size)
+                allowed = [
+                    t for t in allowed
+                    if 0 <= t < scores.shape[-1]
                 ]
-                # 1. copy original scores for all allowed tokens
-                mask[allowed_tensor] = scores[b, allowed_tensor]
-
-                # 2. boost NEXT_FOR tokens on top of their original scores
-                if self.edge_boost != 0.0:
-                    boost_candidates = allowed_tensor[
-                        torch.isin(
-                            allowed_tensor,
-                            torch.tensor(
-                                list(self.next_for_token_ids),
-                                dtype=torch.long,
-                                device=scores.device,
-                            )
-                        )
-                    ]
-                    mask[boost_candidates] += self.edge_boost
+                mask[allowed] = scores[b, allowed]
             else:
                 mask[self.eos_token_id] = scores[b, self.eos_token_id]
 
             scores[b] = mask
 
         return scores
-
-
-# ---------------------------------------------------------------------------
-# 2.  HIGH-LEVEL AGENT
-# ---------------------------------------------------------------------------
-
+    
 class GCRProcessAgent:
     """
-    End-to-end agent that, given a seed entity and a natural-language
-    question, returns the top-K process paths constrained to the OCEL graph.
-
-    Parameters
-    ----------
-    model_id : str
-        HuggingFace model identifier (e.g. "Qwen/Qwen2.5-1.5B-Instruct").
-    graph : nx.DiGraph
-        NetworkX graph produced by ocel_to_graph_with_pm4py.
-    device : str
-        "cpu" or "cuda".
+    Single-graph GCR agent using event-centric object-valid paths.
     """
 
-    def __init__(self, model_id: str, graph: nx.DiGraph, device: str = "cpu"):
+    def __init__(
+        self,
+        model_id: str,
+        events: Dict[str, object],
+        event_successors: Dict[str, List[object]],
+        device: str = "cpu",
+    ):
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=torch.float32,
-            low_cpu_mem_usage=True,
             device_map=device,
         )
         self.device = device
-        self.graph = graph
+        self.events = events
+        self.event_successors = event_successors
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    def _build_trie(
+            self,
+            start_events: List[object],
+            anchor_object: str,
+            max_depth: int,
+        ) -> ProcessTrie:
 
-    def _build_trie_for_seed(self, seed_node: str, max_depth: int):
-        """Build a ProcessTrie from all paths starting at *seed_node*."""
-        path_strings = collect_unique_path_strings(
-            self.graph, [seed_node], max_depth=max_depth
-        )
-        return build_trie_from_path_strings(path_strings, self.tokenizer)
+            paths = enumerate_object_valid_paths(
+                event_successors=self.event_successors,
+                start_events=start_events,
+                anchor_object=anchor_object,
+                max_depth=max_depth,
+            )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+            trie = ProcessTrie()
 
-    def generate_compliant_paths(
+            for path in paths:
+                text = linearize_event_path(path)
+                ids = self.tokenizer.encode(text, add_special_tokens=False)
+                if ids:
+                    trie.insert(ids)
+
+            return trie
+    
+    def generate_paths(
         self,
-        seed_entity: str,
+        start_events: List[object],
+        anchor_object: str,
         question: str,
         num_paths: int = 3,
-        max_depth: int = 4,
+        max_depth: int = 5,
         max_new_tokens: int = 100,
-    ) -> List[str]:
-        """
-        Generate *num_paths* graph-constrained reasoning paths starting from
-        *seed_entity* in response to *question*.
+        trie: Optional[ProcessTrie] = None,
+    ) -> Tuple[List[str], int]:
 
-        Returns
-        -------
-        List[str]
-            Decoded path strings (one per beam), guaranteed to be valid walks
-            in self.graph.
+        prompt = (f"Question: {question}\n"
+                 f"Context: Found object {anchor_object}.\n"
+                    f"Reasoning Path: ")
+        
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        prompt_len = inputs.input_ids.shape[1]
+
+        if trie is None:
+            trie = self._build_trie(start_events, anchor_object, max_depth)
+
+        processor = LogitsProcessorList([
+            GCRProcessProcessor(trie, [prompt_len], self.tokenizer)
+        ])
+
+        outputs = self.model.generate(
+            **inputs,
+            logits_processor=processor,
+            num_beams=num_paths,
+            num_return_sequences=num_paths,
+            max_new_tokens=max_new_tokens,
+            early_stopping=True,
+        )
+
+        return [
+            self.tokenizer.decode(o[prompt_len:], skip_special_tokens=True)
+            for o in outputs
+        ], prompt_len
+    
+    def generate_unconstrained(
+        self,
+        question: str,
+        anchor_object: str,
+        G_context: nx.DiGraph,
+        num_paths: int = 3,
+        max_new_tokens: int = 100,
+        max_hops: int = 3
+    ) -> Tuple[List[str], int]:
         """
-        # A. Prompt
+        Enhanced unconstrained generation for ablation studies.
+        Provides the LLM with the local graph context in the prompt 
+        without enforcing a decoding constraint.
+        """
+        
+        # 1. Extract local neighborhood context from the graph
+        # This serves as the "Soft Constraint" (RAG-style)
+        subgraph_paths = []
+        if anchor_object in G_context:
+            # Use simple BFS or path enumeration to get raw graph strings
+            # Similar to GCR path extraction but used as prompt text only
+            from utils.graph_utils import collect_unique_path_strings
+            subgraph_paths = collect_unique_path_strings(
+                G_context, [anchor_object], max_depth=max_hops
+            )[:10] # Limit to 10 for prompt efficiency
+        
+        context_str = "\n".join(subgraph_paths) if subgraph_paths else "No local context found."
+
+        # 2. Build the rich instruction prompt
         prompt = (
+            f"You are a process mining assistant. Your task is to generate {num_paths} "
+            f"valid process reasoning paths to answer the question starting from the seed entity.\n\n"
+            f"### FORMAT RULES:\n"
+            f"- Alternate strictly between nodes and relations: Node REL Node REL Node ...\n"
+            f"- Event nodes: Event:Activity_Name (use underscores, e.g. Event:Create_Purchase_Order)\n"
+            f"- Object nodes: Object:object_type (e.g. Object:goods_receipt)\n"
+            f"- Relations: plain lowercase string (e.g. goods_receipt, NEXT_FOR_purchase_order)\n"
+            f"- No punctuation, no numbering, no explanation, no newlines\n"
+            f"- Output the paths only, nothing else\n\n"
+            f"### EXAMPLE PATHS:\n"
+            f"Event:Create_Purchase_Order NEXT_FOR_purchase_order Event:Approve_Purchase_Order NEXT_FOR_purchase_order Event:Create_Goods_Receipt\n\n"
+            f"### VALID GRAPH CONTEXT FROM SEED:\n"
+            f"{context_str}\n\n"
             f"Question: {question}\n"
-            f"Context: Found Object {seed_entity}.\n"
+            f"Seed entity: {anchor_object}\n\n"
             f"Reasoning Path: "
         )
+
+        # 3. Standard model generation
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
         prompt_len = inputs.input_ids.shape[1]
 
-        # B. Build trie for this seed
-        process_trie = self._build_trie_for_seed(seed_entity, max_depth=max_depth)
-
-        # C. Constrained logits processor
-        logits_processor = LogitsProcessorList(
-            [GCRProcessProcessor(process_trie, [prompt_len], self.tokenizer)]
-        )
-
-        # D. Constrained beam search
-        output_ids = self.model.generate(
+        outputs = self.model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
             num_beams=num_paths,
             num_return_sequences=num_paths,
-            logits_processor=logits_processor,
-            early_stopping=True,
-        )
-
-        # E. Decode (strip the prompt prefix)
-        paths = [
-            self.tokenizer.decode(g[prompt_len:], skip_special_tokens=True)
-            for g in output_ids
-        ]
-        return paths
-
-    def generate_unconstrained_paths(
-        self,
-        seed_entity: str,
-        question: str,
-        num_paths: int = 3,
-        max_depth: int = 4,
-        max_new_tokens: int = 100,
-    ) -> List[str]:
-        """
-        Identical prompt and beam search, but *without* trie constraints.
-        Used as the baseline ('GCR w/o constraint') in the ablation study,
-        directly mirroring Figure 5 of Luo et al. (2024).
-        """
-        path_strings = collect_unique_path_strings(self.graph, [seed_entity], max_depth=max_depth)
-        context = "\n".join(path_strings[:5])  # cap to avoid context overflow
-
-        prompt = (
-            f"You are a process mining assistant. Output ONLY a valid process path "
-            f"in the format: EntityType:Label REL_LABEL EntityType:Label REL_LABEL ...\n"
-            f"Do not explain. Do not number steps. Output the path only.\n\n"
-            f"The following are valid paths in the process graph starting from the seed entity:\n"
-            f"{context}\n\n"
-            f"Question: {question}\n"
-            f"Seed entity: {seed_entity}\n"
-            f"Reasoning Path: Event: or Object:"
-        )
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        prompt_len = inputs.input_ids.shape[1]
-
-        output_ids = self.model.generate(
-            **inputs,
             max_new_tokens=max_new_tokens,
-            num_beams=num_paths,
-            num_return_sequences=num_paths,
-            early_stopping=True,
         )
 
-        paths = [
-            self.tokenizer.decode(g[prompt_len:], skip_special_tokens=True)
-            for g in output_ids
-        ]
-        return paths
-
+        return [
+            self.tokenizer.decode(o[prompt_len:], skip_special_tokens=True).strip()
+            for o in outputs
+        ], prompt_len
+    
     def timed_generate(
         self,
-        seed_entity: str,
+        anchor_object: str,
         question: str,
         constrained: bool = True,
+        enrich: bool = True,
+        G_context = None,
         num_paths: int = 3,
-        max_depth: int = 4,
+        max_depth: int = 5,
+        max_new_tokens: int = 100,
     ) -> dict:
         """
-        Wrapper that records wall-clock timing for the efficiency analysis
-        table (cf. Table 2 in Luo et al., 2024).
+        Run constrained or unconstrained path generation and return paths
+        together with wall-clock timing and prompt length for efficiency analysis
+        (cf. Table 2 in Luo et al., 2025).
+
+        When enrich=True, constrained paths are additionally enriched with
+        object context from G_context via enrich_paths_with_context(). This
+        adds a context_block key to the return dict — a structured natural-language
+        description of the objects and relations on each path, ready for injection
+        into the large LLM prompt in run_evaluation.py. G_context must be
+        provided when enrich=True.
+
+        Parameters
+        ----------
+        anchor_object : str
+            Query anchor object ID (e.g. "material:835").
+        question : str
+            Natural-language question.
+        constrained : bool
+            True  -> trie-constrained beam search (GCR proper).
+            False -> unconstrained beam search (ablation baseline).
+        enrich : bool
+            True -> also run enrich_paths_with_context after decoding.
+            Only valid when constrained=True; raises ValueError otherwise.
+        G_context : nx.DiGraph | None
+            Required when enrich=True.
+        num_paths / max_depth / max_new_tokens : int
+            Generation hyperparameters.
 
         Returns
         -------
-        dict with keys: paths, trie_build_s, generation_s, prompt_tokens
+        dict with keys:
+            paths          : List[str]  decoded beam outputs
+            trie_build_s   : float      seconds building ProcessTrie (0 if unconstrained)
+            generation_s   : float      seconds in model.generate()
+            enrich_s       : float      seconds for context enrichment (0 if not enriched)
+            total_s        : float      sum of all three
+            prompt_tokens  : int        tokens in the shared prompt
+            context_block  : str | None structured object context (None if not enriched)
         """
-        inputs = self.tokenizer(
-            f"Question: {question}\nContext: Found Object {seed_entity}.\nReasoning Path: ",
-            return_tensors="pt",
-        )
-        prompt_tokens = inputs.input_ids.shape[1]
+        if enrich and not constrained:
+            raise ValueError("enrich=True requires constrained=True.")
+        if enrich and G_context is None:
+            raise ValueError("enrich=True requires G_context to be provided.")
+
+        start_events = [
+            event for event in self.events.values()
+            if anchor_object in event.objects
+        ]
+        if not start_events:
+            print(f"  [WARNING] No start events found for object '{anchor_object}'.")
 
         trie_build_s = 0.0
+        enrich_s = 0.0
+        context_block = None
+
         if constrained:
             t0 = time.perf_counter()
-            _ = self._build_trie_for_seed(seed_entity, max_depth=max_depth)
+            trie = self._build_trie(start_events, anchor_object, max_depth)
             trie_build_s = time.perf_counter() - t0
 
-        t1 = time.perf_counter()
-        if constrained:
-            paths = self.generate_compliant_paths(
-                seed_entity, question, num_paths=num_paths, max_depth=max_depth
+            t1 = time.perf_counter()
+            paths, prompt_tokens = self.generate_paths(
+                start_events=start_events,
+                anchor_object=anchor_object,
+                question=question,
+                num_paths=num_paths,
+                max_depth=max_depth,
+                max_new_tokens=max_new_tokens,
+                trie=trie,
             )
+            generation_s = time.perf_counter() - t1
+
+        if enrich:
+            t2 = time.perf_counter()
+
+            reified_paths = [
+                reify_generated_path(self, generated_string=p, anchor_object=anchor_object, G_context=G_context)
+                for p in paths[:num_paths]
+            ]
+            
+            # Now context_block receives Event objects, not strings
+            context_block = enrich_paths_with_context(
+                paths=reified_paths,
+                anchor_object=anchor_object,
+                G_context=G_context,
+                max_depth=max_depth,
+            )
+            enrich_s = time.perf_counter() - t2
         else:
-            paths = self.generate_unconstrained_paths(
-                seed_entity, question, num_paths=num_paths, max_depth=max_depth
+            t1 = time.perf_counter()
+            paths, prompt_tokens = self.generate_unconstrained(
+                anchor_object=anchor_object,
+                question=question,
+                G_context=G_context,
+                num_paths=num_paths,
+                max_new_tokens=max_new_tokens,
+                max_hops=max_depth,
             )
-        generation_s = time.perf_counter() - t1
+            generation_s = time.perf_counter() - t1
 
         return {
-            "paths": paths,
-            "trie_build_s": trie_build_s,
-            "generation_s": generation_s,
-            "total_s": trie_build_s + generation_s,
+            "paths":         paths,
+            "trie_build_s":  trie_build_s,
+            "generation_s":  generation_s,
+            "enrich_s":      enrich_s,
+            "total_s":       trie_build_s + generation_s + enrich_s,
             "prompt_tokens": prompt_tokens,
+            "context_block": context_block,
         }

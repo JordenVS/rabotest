@@ -1,0 +1,5 @@
+system,n,path_recall,path_precision,path_f1,lcs_recall
+gcr_constrained,5.0,,,,
+gcr_unconstrained,5.0,,,,
+rag,5.0,,,,
+graphrag,5.0,,,,

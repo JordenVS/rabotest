@@ -1,0 +1,12 @@
+\begin{table}
+\caption{Path-retrieval evaluation on 100-instance P2P OCEL benchmark. EM = exact match against gold answer (surface overlap), MRR = mean reciprocal rank over GCR beams, Path-Recall = fraction of gold activity sequences recovered, Path-Precision = fraction of beams containing a gold activity.}
+\label{tab:path_results}
+\begin{tabular}{lrrrrr}
+\toprule
+system & n & path_recall & path_precision & path_f1 & lcs_recall \\
+\midrule
+gcr_constrained_paths & 100.0000 & 0.8790 & 0.6612 & 0.6886 & 0.9131 \\
+gcr_unconstrained_paths & 100.0000 & 0.0067 & 0.0029 & 0.0040 & 0.5305 \\
+\bottomrule
+\end{tabular}
+\end{table}

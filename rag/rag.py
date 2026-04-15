@@ -86,8 +86,7 @@ def _build_embeddings(backend: EmbeddingBackend):
 
     return HuggingFaceEmbeddings(
         model_name=cfg["model_name"],
-        encode_kwargs=cfg.get("encode_kwargs", {}), 
-        show_progress_bar=True,
+        encode_kwargs=cfg.get("encode_kwargs", {})
     )
 
 # ---------------------------------------------------------------------------
@@ -179,7 +178,7 @@ def _build_llm(backend: LLMBackend, model: str, **kwargs):
         pipe = hf_pipeline(
             "text-generation",
             model=model,
-            max_new_tokens=kwargs.get("max_new_tokens", 512),
+   #         max_new_tokens=kwargs.get("max_new_tokens", 512),
             device_map="auto",
         )
         return HuggingFacePipeline(pipeline=pipe)
