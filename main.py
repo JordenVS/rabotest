@@ -51,8 +51,8 @@ if __name__ == "__main__":
     # print("BGE retriever is ready.")
 
 
-    G_behavior, G_context = build_process_graphs_ocel2("data/ocel2-p2p.json", "graphs/behavior_graph2.graphml", "graphs/context_graph2.graphml")
-    ocfg = build_ocdfg_from_ocel2("data/ocel2-p2p.json")
+    G_behavior, G_context = build_process_graphs_ocel2("data/ocel2-p2p.json", "graphs/behavior_graph.graphml", "graphs/context_graph.graphml")
+    #ocfg = build_ocdfg_from_ocel2("data/ocel2-p2p.json")
     #docs = get_docs_from_pm4py("data/ocel2-p2p.json")
     #docs.sort(key=lambda d: d.metadata.get("id", ""))
     #for doc in docs[:10]:

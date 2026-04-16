@@ -1,370 +1,458 @@
 """
 eval/metrics.py
----------------
-All evaluation metric functions for GCR-on-OCEL experiments.
+===============
+Shared metric functions and I/O helpers for the GCR evaluation pipeline.
 
-Metrics are grouped into four categories, mirroring the evaluation
-dimensions described in the thesis methods chapter:
+Imported by both eval_paths.py (path-retrieval evaluation) and
+eval_answers.py (answer-generation evaluation).  Keeping metrics in one
+place guarantees that both evaluation scripts score predictions identically,
+which is a basic reproducibility requirement for published results.
 
-  1. Correctness  — Hit and F1 (adapted from Luo et al., 2024)
-  2. Faithfulness — constraint compliance and hallucination rate
-  3. Process-specific — temporal validity and lifecycle coverage
-  4. Path quality — token-overlap F1 between generated and ground-truth strings
+Metrics implemented
+-------------------
+exact_match       : Rajpurkar et al. (2016) — normalised substring match.
+token_f1          : Rajpurkar et al. (2016) — token-overlap F1.
+rouge_l           : Lin (2004) — longest-common-subsequence F1.
+mrr               : Mean Reciprocal Rank over a ranked beam list.
+counterfactual_acc: Binary yes/no polarity accuracy.
+path_recall       : Fraction of gold activity sequences recovered in beams.
+path_precision    : Fraction of beams that contain at least one gold activity.
 
 References
 ----------
-Luo, Y. et al. (2024). Graph-constrained Reasoning: Faithful Reasoning on
-Knowledge Graphs with Large Language Models.
+Rajpurkar, P., Zhang, J., Lopyrev, K., & Liang, P. (2016).
+    SQuAD: 100,000+ questions for machine comprehension of text. EMNLP.
+Lin, C.-Y. (2004).
+    ROUGE: A package for automatic evaluation of summaries.
+    ACL Workshop on Text Summarisation Branches Out.
 """
 
 from __future__ import annotations
 
+import json
 import re
-from typing import List, Set, Dict, Optional
+import string
+from collections import Counter, defaultdict
+from typing import Dict, List, Optional
 
-import networkx as nx
+import numpy as np
 
 
 # ===========================================================================
-# 1.  CORRECTNESS METRICS
+# I/O helpers
 # ===========================================================================
 
-def compute_hit(
-    generated_paths: List[str],
-    ground_truth_paths: List[str],
-) -> float:
-    """
-    Hit@K: 1.0 if *any* generated path exactly matches *any* ground-truth
-    path, 0.0 otherwise.
+def load_jsonl(path: str) -> List[Dict]:
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(l) for l in f if l.strip()]
 
-    This directly mirrors the Hit metric used by Luo et al. (2024) on
-    WebQSP/CWQ, adapted to path-level matching rather than answer-entity
-    matching.
 
-    Parameters
-    ----------
-    generated_paths   : Decoded path strings produced by the model.
-    ground_truth_paths: Linearised ground-truth paths from the eval dataset.
+def load_dataset(path: str) -> List[Dict]:
+    """Accepts a JSON array or JSONL file."""
+    with open(path, encoding="utf-8") as f:
+        content = f.read().strip()
+    if content.startswith("["):
+        return json.loads(content)
+    return [json.loads(l) for l in content.splitlines() if l.strip()]
+
+
+def load_done(path: str) -> set:
+    """Return (instance_id, system) pairs already written — for resume support."""
+    done = set()
+    if not __import__("os").path.exists(path):
+        return done
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+                done.add((r["instance_id"], r["system"]))
+            except (json.JSONDecodeError, KeyError):
+                pass
+    return done
+
+
+def append_record(path: str, record: Dict) -> None:
+    """Append one JSON record to a JSONL file."""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+
+
+# ===========================================================================
+# Text normalisation
+# ===========================================================================
+
+def normalise(text: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace."""
+    text = text.lower()
+    text = text.translate(str.maketrans("", "", string.punctuation))
+    return " ".join(text.split())
+
+
+def _tokens(text: str) -> List[str]:
+    return normalise(text).split()
+
+
+def _create_event(event_str: str) -> str:
     """
-    gt_set = set(p.strip() for p in ground_truth_paths)
-    for gen in generated_paths:
-        if gen.strip() in gt_set:
-            return 1.0
+    Normalise an activity name into the canonical event-node format used in
+    the serialised path strings: "event:<activity_with_underscores>".
+    """
+    s = normalise(event_str).replace(" ", "_")
+    return s if s.startswith("event:") else "event:" + s
+
+
+# ===========================================================================
+# Core metrics  (Rajpurkar et al., 2016; Lin, 2004)
+# ===========================================================================
+
+def exact_match(prediction: str, gold: str) -> float:
+    """Normalised substring exact match."""
+    return float(normalise(gold) in normalise(prediction))
+
+
+def token_f1(prediction: str, gold: str) -> float:
+    """Token-level F1 (Rajpurkar et al., 2016)."""
+    pred_toks = _tokens(prediction)
+    gold_toks = _tokens(gold)
+    if not pred_toks or not gold_toks:
+        return float(pred_toks == gold_toks)
+    common = Counter(pred_toks) & Counter(gold_toks)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0.0
+    p = num_same / len(pred_toks)
+    r = num_same / len(gold_toks)
+    return 2 * p * r / (p + r)
+
+
+def _lcs(a: List[str], b: List[str]) -> int:
+    m, n = len(a), len(b)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            dp[i][j] = (
+                dp[i - 1][j - 1] + 1
+                if a[i - 1] == b[j - 1]
+                else max(dp[i - 1][j], dp[i][j - 1])
+            )
+    return dp[m][n]
+
+
+def rouge_l(prediction: str, gold: str) -> float:
+    """ROUGE-L F1 (Lin, 2004)."""
+    p_toks = _tokens(prediction)
+    g_toks = _tokens(gold)
+    if not p_toks or not g_toks:
+        return float(p_toks == g_toks)
+    lcs = _lcs(p_toks, g_toks)
+    prec = lcs / len(p_toks)
+    rec  = lcs / len(g_toks)
+    return 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+
+
+def mrr(beams: List[str], gold: str) -> float:
+    """Mean Reciprocal Rank over a ranked beam list."""
+    gold_norm = normalise(gold)
+    for rank, beam in enumerate(beams, start=1):
+        if gold_norm in normalise(beam):
+            return 1.0 / rank
     return 0.0
 
 
-def _token_f1(pred: str, gold: str) -> float:
-    """Token-overlap F1 between two strings (case-insensitive)."""
-    pred_tokens = pred.lower().split()
-    gold_tokens = gold.lower().split()
-    if not pred_tokens or not gold_tokens:
-        return 0.0
-    pred_set = set(pred_tokens)
-    gold_set = set(gold_tokens)
-    common = pred_set & gold_set
-    if not common:
-        return 0.0
-    precision = len(common) / len(pred_set)
-    recall = len(common) / len(gold_set)
-    return 2 * precision * recall / (precision + recall)
-
-
-def compute_path_f1(
-    generated_paths: List[str],
-    ground_truth_paths: List[str],
-) -> float:
+def counterfactual_acc(prediction: str, gold_answer: str) -> float:
     """
-    Path-level F1: maximum token-overlap F1 between the best generated path
-    and any ground-truth path.
-
-    Analogous to the F1 metric in Luo et al. (2024), which balances precision
-    and recall over the set of answer entities.  Here we operate over the
-    token sequences of linearised paths instead.
+    Binary accuracy for counterfactual questions.
+    gold_answer must be "Yes" or "No"; the first polar word in prediction is used.
     """
-    if not generated_paths or not ground_truth_paths:
-        return 0.0
-    best = 0.0
-    for gen in generated_paths:
-        for gt in ground_truth_paths:
-            best = max(best, _token_f1(gen, gt))
-    return best
+    p = normalise(prediction)
+    gold_polar = normalise(gold_answer)
+    has_no  = bool(re.search(r"\bno\b",  p))
+    has_yes = bool(re.search(r"\byes\b", p))
+    if gold_polar == "no":
+        return float(has_no and not has_yes)
+    return float(has_yes and not has_no)
 
 
-def compute_activity_sequence_accuracy(
-    generated_paths: List[str],
-    ground_truth_paths: List[str],
-) -> float:
-    """
-    Check whether the ordered sequence of *activity labels* in any generated
-    path matches that of any ground-truth path, ignoring object-type tokens
-    and edge labels.
-
-    This is more lenient than exact Hit because it abstracts away qualifiers,
-    making it suitable for comparing paths that differ only in object types
-    (common in OCEL 2.0 where the same activity touches many object types).
-    """
-    def extract_activities(path: str) -> List[str]:
-        # Tokens of the form  Event:<ActivityName>
-        return re.findall(r"Event:(\S+)", path)
-
-    gt_act_seqs = [extract_activities(p) for p in ground_truth_paths]
-    for gen in generated_paths:
-        gen_acts = extract_activities(gen)
-        if gen_acts in gt_act_seqs:
-            return 1.0
-    return 0.0
+def score_answer(
+    prediction: str,
+    gold_answer: str,
+    question_family: str,
+    beams: Optional[List[str]] = None,
+) -> Dict[str, float]:
+    """Compute all applicable metrics for one (prediction, gold) pair."""
+    scores: Dict[str, float] = {}
+    if question_family == "next_step":
+        scores["em"]      = exact_match(prediction, gold_answer)
+        scores["tok_f1"]  = token_f1(prediction, gold_answer)
+        scores["rouge_l"] = rouge_l(prediction, gold_answer)
+        scores["mrr"]     = mrr(beams or [prediction], gold_answer)
+    elif question_family == "counterfactual":
+        scores["cf_acc"] = counterfactual_acc(prediction, gold_answer)
+        scores["em"]     = scores["cf_acc"]
+    else:
+        scores["em"] = exact_match(prediction, gold_answer)
+    return scores
 
 
 # ===========================================================================
-# 2.  FAITHFULNESS METRICS
+# Path-specific metrics
 # ===========================================================================
 
-def _parse_path_nodes_and_edges(path_str: str):
-    """
-    Parse a linearised path string back into (node_labels, edge_labels).
-
-    Supports two serialisation formats used in the codebase:
-      - linearize_path:     "Event:A rel1 Object:B rel2 Event:C"
-      - serialize_ocel_path_v2: "Event:A --(rel1)--> Object:B --(rel2)--> Event:C"
-    """
-    # Normalise v2 arrow syntax to plain tokens
-    normalised = re.sub(r"\s*--\(([^)]+)\)-->\s*", r" \1 ", path_str)
-    tokens = normalised.strip().split()
-
-    nodes = []
-    edges = []
-    for tok in tokens:
-        if tok.startswith("Event:") or tok.startswith("Object:"):
-            nodes.append(tok)
-        else:
-            edges.append(tok)
-    return nodes, edges
-
-
-def _build_valid_semantic_edges(G: nx.DiGraph) -> Set[tuple]:
-    """
-    Pre-compute the set of valid (src_label, rel, tgt_label) triples from G.
-    Uses the same node_semantic_label scheme as the trie construction.
-    """
-    from gcr.gcr import node_label
-
-    valid = set()
-    for u, v, data in G.edges(data=True):
-        rel = data.get("label", "rel").replace(" ", "_")
-        valid.add((node_label(G, u), rel, node_label(G, v)))
-    return valid
-
-
-def compute_constraint_compliance(
-    generated_paths: List[str],
-    G: nx.DiGraph,
-    valid_edges: Optional[Set[tuple]] = None,
+def calculate_path_recall(
+    predicted_beams: List[List[str]],
+    gold_paths: List[List[List[str]]],
 ) -> float:
     """
-    Fraction of generated paths where *every* consecutive (node, edge, node)
-    triple is present in the OCEL graph.
+    Measures what fraction of the gold activity sequences are recoverable
+    from the predicted beams.
 
-    For GCR (constrained), this should be 1.0 by construction.
-    For the unconstrained baseline, this measures hallucination.
-
-    Corresponds to the "faithful reasoning ratio" in Luo et al. (2024, §5.3).
+    Gold format: a list of path-sets, where each path-set is a list of
+    activity sequences (List[str]).  A gold path-set is considered "found"
+    if *any* of its sequences has all activities present in the combined
+    beam string (order-insensitive heuristic).
 
     Parameters
     ----------
-    generated_paths : Decoded path strings.
-    G               : The OCEL graph used for trie construction.
-    valid_edges     : Pre-computed edge set (pass once; computed lazily otherwise).
+    predicted_beams : Ranked list of decoded path strings.
+    gold_paths      : ``q["gold_paths"]`` from the evaluation dataset.
+
+    Returns
+    -------
+    float in [0, 1].
     """
-    if valid_edges is None:
-        valid_edges = _build_valid_semantic_edges(G)
-
-    if not generated_paths:
-        return 0.0
-
-    compliant = 0
-    for path_str in generated_paths:
-        nodes, edges = _parse_path_nodes_and_edges(path_str)
-        # A path needs at least one edge to be verifiable
-        if len(nodes) < 2:
-            compliant += 1  # trivial single-node path — count as compliant
-            continue
-        path_ok = True
-        for i in range(len(edges)):
-            if i + 1 >= len(nodes):
-                break
-            triple = (nodes[i], edges[i], nodes[i + 1])
-            if triple not in valid_edges:
-                path_ok = False
-                break
-        if path_ok:
-            compliant += 1
-
-    return compliant / len(generated_paths)
+    if not gold_paths:
+        return 1.0
+    combined = " ".join(predicted_beams).lower()
+    found = sum(
+        1
+        for path_set in gold_paths
+        for sequence in path_set
+        if all(_create_event(act) in combined for act in sequence)
+    )
+    return found / len(gold_paths)
 
 
-def compute_hallucination_rate(
-    generated_paths: List[str],
-    G: nx.DiGraph,
-    valid_edges: Optional[Set[tuple]] = None,
-) -> float:
-    """Complement of constraint compliance: fraction of paths with ≥1 hallucinated edge."""
-    return 1.0 - compute_constraint_compliance(generated_paths, G, valid_edges)
-
-
-# ===========================================================================
-# 3.  PROCESS-SPECIFIC METRICS
-# ===========================================================================
-
-def compute_temporal_validity(
-    generated_paths: List[str],
-    G: nx.DiGraph,
+def calculate_path_precision(
+    predicted_beams: List[str],
+    gold_paths: List[List[List[str]]],
 ) -> float:
     """
-    For each generated path, check whether every consecutive pair of event
-    nodes appears in non-decreasing timestamp order in the graph.
+    Fraction of predicted beams that contain at least one gold activity.
 
-    A path that traverses events out of causal order is semantically wrong
-    even if structurally valid (all edges exist in the graph).
-
-    Returns the fraction of generated paths that are temporally valid.
-    """
-    from utils.generate_eval_dataset import node_semantic_label
-
-    # Build a lookup: semantic_label -> list of (node_id, timestamp)
-    label_to_ts: Dict[str, List] = {}
-    for n, data in G.nodes(data=True):
-        if data.get("entity_type") == "Event":
-            label = node_semantic_label(G, n)
-            ts_str = data.get("timestamp", "")
-            label_to_ts.setdefault(label, []).append(ts_str)
-
-    if not generated_paths:
-        return 0.0
-
-    valid_count = 0
-    for path_str in generated_paths:
-        event_labels = re.findall(r"Event:\S+", path_str)
-        if len(event_labels) < 2:
-            valid_count += 1  # nothing to compare
-            continue
-
-        path_valid = True
-        for i in range(len(event_labels) - 1):
-            ts_a_list = label_to_ts.get(event_labels[i], [])
-            ts_b_list = label_to_ts.get(event_labels[i + 1], [])
-            # If timestamps are available, check at least one valid ordering exists
-            if ts_a_list and ts_b_list:
-                # Accept if any combination is non-decreasing
-                ok = any(
-                    str(a) <= str(b)
-                    for a in ts_a_list
-                    for b in ts_b_list
-                )
-                if not ok:
-                    path_valid = False
-                    break
-        if path_valid:
-            valid_count += 1
-
-    return valid_count / len(generated_paths)
-
-
-def compute_lifecycle_coverage(
-    generated_paths: List[str],
-    ground_truth_events: List[str],
-    G: nx.DiGraph,
-) -> float:
-    """
-    Fraction of the object's ground-truth lifecycle events (activity labels)
-    that appear in *any* of the generated paths.
-
-    Measures whether the generated paths cover the relevant portion of the
-    object's end-to-end process, a notion specific to object-centric event
-    logs (OCEL 2.0) with no direct equivalent in KG-QA evaluation.
+    A beam is considered a "hit" if any activity name from the gold paths
+    appears (case-insensitive substring) in that beam string.
 
     Parameters
     ----------
-    generated_paths       : Decoded path strings.
-    ground_truth_events   : List of event node IDs from expected_outputs.answer.events.
-    G                     : The OCEL graph.
+    predicted_beams : Ranked list of decoded path strings.
+    gold_paths      : ``q["gold_paths"]`` from the evaluation dataset.
+
+    Returns
+    -------
+    float in [0, 1], or NaN if beams is empty.
     """
-    if not ground_truth_events:
-        return 1.0  # vacuously true
-
-    # Convert ground-truth event node IDs to activity labels
-    gt_activities: Set[str] = set()
-    for ev_id in ground_truth_events:
-        act = G.nodes[ev_id].get("activity", "") if ev_id in G.nodes else ""
-        if act:
-            gt_activities.add(f"Event:{act.replace(' ', '_')}")
-
-    if not gt_activities:
-        return 0.0
-
-    # Collect all activity labels mentioned across generated paths
-    generated_activities: Set[str] = set()
-    for path_str in generated_paths:
-        generated_activities.update(re.findall(r"Event:\S+", path_str))
-
-    covered = gt_activities & generated_activities
-    return len(covered) / len(gt_activities)
-
-
-# ===========================================================================
-# 4.  AGGREGATE SCORER
-# ===========================================================================
-
-def score_single(
-    generated_paths: List[str],
-    item: dict,
-    G: nx.DiGraph,
-    valid_edges: Optional[Set[tuple]] = None,
-) -> dict:
-    """
-    Compute all metrics for a single eval item and return them as a dict.
-
-    Parameters
-    ----------
-    generated_paths : Output of the model under evaluation.
-    item            : One record from eval_local.jsonl or eval_localobj.jsonl.
-    G               : The OCEL graph.
-    valid_edges     : Pre-computed edge set (pass for efficiency in loops).
-    """
-    gt_paths = item["expected_outputs"]["paths"]
-    gt_events = item["expected_outputs"]["answer"].get("events", [])
-
-    return {
-        "id": item["id"],
-        "task_type": item["task_type"],
-        # --- Correctness ---
-        "hit": compute_hit(generated_paths, gt_paths),
-        "path_f1": compute_path_f1(generated_paths, gt_paths),
-        "activity_accuracy": compute_activity_sequence_accuracy(
-            generated_paths, gt_paths
-        ),
-        # --- Faithfulness ---
-        "constraint_compliance": compute_constraint_compliance(
-            generated_paths, G, valid_edges
-        ),
-        "hallucination_rate": compute_hallucination_rate(
-            generated_paths, G, valid_edges
-        ),
-        # --- Process-specific ---
-        "temporal_validity": compute_temporal_validity(generated_paths, G),
-        "lifecycle_coverage": compute_lifecycle_coverage(
-            generated_paths, gt_events, G
-        ),
+    if not predicted_beams or not gold_paths:
+        return float("nan")
+    gold_acts = {
+        act.lower()
+        for path_set in gold_paths
+        for seq in path_set
+        for act in seq
     }
+    hits = sum(
+        1 for b in predicted_beams if any(ga in b.lower() for ga in gold_acts)
+    )
+    return hits / len(predicted_beams)
+
+def calculate_lcs_similarity(predicted_path, actual_path):
+    # Standard Dynamic Programming approach for LCS
+    n, m = len(predicted_path), len(actual_path)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if predicted_path[i-1] == actual_path[j-1]:
+                dp[i][j] = dp[i-1][j-1] + 1
+            else:
+                dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+    
+    lcs_length = dp[n][m]
+
+    #lcs_precision = lcs_length / len(predicted_path) if len(predicted_path) > 0 else 0
+    lcs_recall = lcs_length / len(actual_path) if len(actual_path) > 0 else 0
+    #lcs_f1 = 2 * lcs_precision * lcs_recall / (lcs_precision + lcs_recall) if (lcs_precision + lcs_recall) > 0 else 0
+    
+    return lcs_recall # This is usually the most useful "Path Accuracy" score
+
+def get_transitions(path):
+    # Turns [A, B, C] into {(A, B), (B, C)}
+    return set(zip(path, path[1:]))
+
+def calculate_path_metrics(predicted_path, ground_truth):
+    pred_edges = get_transitions(predicted_path)
+    actual_edges = get_transitions(ground_truth)
+    
+    tp = len(pred_edges.intersection(actual_edges))
+    fp = len(pred_edges - actual_edges)
+    fn = len(actual_edges - pred_edges)
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    
+    return precision, recall, f1
+
+def best_path_metrics(normalized_beams, gold_paths):
+    all_precisions = []
+    all_recalls = []
+    all_f1s = []
+    all_lcs = []
+    for beam in normalized_beams:
+        p, r, f = calculate_path_metrics(beam, gold_paths) # Using transition function
+        all_precisions.append(p)
+        all_recalls.append(r)
+        all_f1s.append(f)
+        lcs = calculate_lcs_similarity(beam, gold_paths)
+        all_lcs.append(lcs)
+
+    # 1. Best-of-N (The "Top" performance)
+    best_precision = max(all_precisions)
+    best_recall = max(all_recalls)
+    best_f1 = max(all_f1s)
+    best_lcs = max(all_lcs)
+
+    # 2. Average (The "Reliability" performance)
+    avg_precision = sum(all_precisions) / len(all_precisions)
+    avg_recall = sum(all_recalls) / len(all_recalls)
+    avg_f1 = sum(all_f1s) / len(all_f1s)
+    avg_lcs = sum(all_lcs) / len(all_lcs)
+
+    return best_precision, best_recall, best_f1, best_lcs, avg_precision, avg_recall, avg_f1, avg_lcs
+
+# ===========================================================================
+# Aggregation
+# ===========================================================================
+
+def aggregate(scored: List[Dict]) -> Dict[str, Dict[str, float]]:
+    """
+    Group per-instance score dicts by system and return mean metrics.
+
+    Handles NaN values gracefully — only non-NaN entries contribute to means.
+    """
+    grouped: Dict[str, List[Dict]] = defaultdict(list)
+    for s in scored:
+        grouped[s["system"]].append(s)
+
+    results = {}
+    for system, recs in grouped.items():
+
+        def _mean(key: str) -> float:
+            vals = [
+                r[key] for r in recs
+                if key in r
+                and r[key] is not None
+                and not (isinstance(r[key], float) and np.isnan(r[key]))
+            ]
+            return float(np.mean(vals)) if vals else float("nan")
+
+        def _p95(key: str) -> float:
+            vals = [
+                r[key] for r in recs
+                if key in r
+                and r[key] is not None
+                and not (isinstance(r[key], float) and np.isnan(r[key]))
+            ]
+            return float(np.percentile(vals, 95)) if vals else float("nan")
+
+        # results[system] = {
+        #     "n":              len(recs),
+        #     "em":             _mean("em"),
+        #     "tok_f1":         _mean("tok_f1"),
+        #     "rouge_l":        _mean("rouge_l"),
+        #     "mrr":            _mean("mrr"),
+        #     "path_recall":    _mean("path_recall"),
+        #     "path_precision": _mean("path_precision"),
+        #     "cf_acc":         _mean("cf_acc"),
+        #     "lat_mean_s":     _mean("answer_s"),
+        #     "lat_p95_s":      _p95("answer_s"),
+        # }
+        results[system] = {
+            "n":              len(recs),
+            "path_recall":             _mean("path_recall"),
+            "path_precision":         _mean("path_precision"),
+            "path_f1":        _mean("path_f1"),
+            "lcs_recall":            _mean("lcs_recall"),
+            # "path_recall":    _mean("path_recall"),
+            # "path_precision": _mean("path_precision"),
+            # "cf_acc":         _mean("cf_acc"),
+            # "lat_mean_s":     _mean("answer_s"),
+            # "lat_p95_s":      _p95("answer_s"),
+        }
+    return results
 
 
-def aggregate_scores(scores: List[dict]) -> dict:
-    """Macro-average all numeric metrics across the score list."""
-    if not scores:
-        return {}
-    numeric_keys = [
-        k for k, v in scores[0].items() if isinstance(v, (int, float))
-    ]
-    return {
-        k: sum(s[k] for s in scores) / len(scores)
-        for k in numeric_keys
-    }
+# ===========================================================================
+# Results reporting  (shared table printer + CSV/LaTeX writer)
+# ===========================================================================
+
+# PATH_METRIC_COLS    = ["n", "em", "tok_f1", "rouge_l", "mrr",
+#                        "path_recall", "path_precision"]
+PATH_METRIC_COLS    = ["n", "path_recall", "path_precision", "path_f1", "lcs_recall"]
+ANSWER_METRIC_COLS  = ["n", "em", "tok_f1", "rouge_l", "mrr",
+                       "cf_acc", "lat_mean_s", "lat_p95_s"]
+ALL_METRIC_COLS     = ["n", "em", "tok_f1", "rouge_l", "mrr",
+                       "path_recall", "path_precision", "cf_acc",
+                       "lat_mean_s", "lat_p95_s"]
+
+
+def print_results_table(results: Dict[str, Dict], metric_cols: List[str]) -> None:
+    """Pretty-print an aggregated results dict to stdout."""
+    print("\n========= RESULTS =========")
+    header = f"{'System':<28}" + "".join(f"{m:>14}" for m in metric_cols)
+    print(header)
+    print("-" * len(header))
+    for sys_name, vals in sorted(results.items()):
+        row = f"{sys_name:<28}"
+        for m in metric_cols:
+            v = vals.get(m, float("nan"))
+            row += f"{v:>14d}" if isinstance(v, int) else f"{v:>14.4f}"
+        print(row)
+
+
+def write_results_table(
+    results: Dict[str, Dict],
+    out_dir: str,
+    caption: str = "",
+    label: str = "tab:results",
+) -> None:
+    """Write results to CSV and LaTeX files in *out_dir*."""
+    import os
+    try:
+        import pandas as pd
+    except ImportError:
+        print("pandas not available — skipping CSV/LaTeX output.")
+        return
+
+    df = (
+        pd.DataFrame(results).T
+        .reset_index()
+        .rename(columns={"index": "system"})
+    )
+
+    csv_path = os.path.join(out_dir, "results_table.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"\nCSV  → {csv_path}")
+
+    tex_path = os.path.join(out_dir, "results_table.tex")
+    float_cols = [c for c in df.columns if c not in ("system", "n")]
+    df[float_cols] = df[float_cols].map(
+        lambda x: round(float(x), 4) if pd.notnull(x) else x
+    )
+    df.to_latex(
+        tex_path,
+        index=False,
+        float_format="%.4f",
+        caption=caption,
+        label=label,
+    )
+    print(f"LaTeX → {tex_path}")

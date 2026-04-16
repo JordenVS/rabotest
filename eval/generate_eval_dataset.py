@@ -1,311 +1,369 @@
-"""
-utils/generate_eval_dataset.py
--------------------------------
-Generates the evaluation dataset from an OCEL 2.0 NetworkX graph.
-
-Serialization contract
------------------------
-Ground-truth paths are serialized using the *same* canonical format as the
-trie construction in gcr/gcr.py:
-
-    label(n0) rel_01 label(n1) rel_12 label(n2) ...
-
-where label() = "Event:<Activity_With_Underscores>" or
-               "Object:<object_type_with_underscores>".
-
-This ensures that Hit and F1 comparisons between generated and ground-truth
-paths are meaningful (no space/underscore mismatch, no duplicate interior
-nodes).
-
-Fixes vs. original
-------------------
-1. node_semantic_label / linearize_triplets now delegate to the shared
-   node_label() from gcr.gcr, eliminating any risk of future drift.
-
-2. linearize_triplets now produces chain-style output (no duplicate interior
-   nodes), consistent with the fixed linearize_path in gcr/gcr.py.
-
-3. Added fixed random seed, stratified sampling, and increased default sample
-   sizes for reproducibility and coverage.
-"""
-
 from __future__ import annotations
-
-import json
 import random
+import uuid
 from collections import defaultdict
-from typing import List, Dict
-
+import argparse
+import json
+from typing import Any, Dict, List
+ 
+import pm4py
 import networkx as nx
+ 
+# Project-internal imports
+from utils.graph_utils import load_graphml_to_networkx
 
-# Import the single source-of-truth label function from gcr.gcr
-from gcr.gcr import node_label, extract_paths
+QUESTION_TEMPLATES = {
+    "next_step": [
+        "What happened next for {obj} after {act}?",
+        "Which activity followed {act} for {obj}?"
+    ],
+    "why": [
+        "Why did {act2} occur for {obj}?",
+        "Why was {obj} processed with {act2}?"
+    ],
+    "counterfactual": [
+        "Could {act2} have occurred immediately after {act1} for {obj}?",
+        "Was it possible for {act2} to happen before {act1} for {obj}?"
+    ]
+}
 
-
-# ---------------------------------------------------------------------------
-# Canonical label (thin wrapper kept for backward compatibility)
-# ---------------------------------------------------------------------------
-
-def node_semantic_label(G: nx.DiGraph, n: str) -> str:
-    """Alias for gcr.gcr.node_label — do not duplicate the logic here."""
-    return node_label(G, n)
-
-
-# ---------------------------------------------------------------------------
-# Ground-truth path linearization  (chain format, matching trie format)
-# ---------------------------------------------------------------------------
-
-def linearize_triplets(G: nx.DiGraph, trip_path: List[tuple]) -> str:
+def extract_object_lifecycles(ocel):
     """
-    Convert a list of (u, rel, v) triples to a canonical chain string:
-
-        label(u0) rel_01 label(u1) rel_12 label(u2) ...
-
-    Interior nodes are emitted once only.  This matches the format produced
-    by gcr.gcr.linearize_path, ensuring Hit/F1 comparisons are valid.
+    Returns:
+      lifecycles: dict
+        oid -> {
+          "object_type": str,
+          "activities": [activity_1, activity_2, ...]
+        }
     """
-    if not trip_path:
-        return ""
-    parts: List[str] = [node_label(G, trip_path[0][0])]
-    for u, rel, v in trip_path:
-        parts.append(rel)
-        parts.append(node_label(G, v))
-    return " ".join(parts)
+    events_df = ocel.events.sort_values("ocel:timestamp")
+    objects_df = ocel.objects
+    relations_df = ocel.relations
 
+    lifecycles = {}
 
-# ---------------------------------------------------------------------------
-# Stratified sampling helpers
-# ---------------------------------------------------------------------------
+    grouped = relations_df.groupby("ocel:oid")
 
-def _stratified_event_sample(
-    G: nx.DiGraph,
-    num: int,
-    rng: random.Random,
-) -> List[str]:
+    for oid, group in grouped:
+        event_ids = group["ocel:eid"].unique()
+        subset = events_df[events_df["ocel:eid"].isin(event_ids)]
+
+        activities = subset["ocel:activity"].tolist()
+        if len(activities) < 2:
+            continue
+
+        obj_type = objects_df.loc[
+            objects_df["ocel:oid"] == oid, "ocel:type"
+        ].values
+
+        lifecycles[oid] = {
+            "object_type": obj_type[0] if len(obj_type) else "object",
+            "activities": activities
+        }
+
+    return lifecycles
+
+def generate_positive_examples(lifecycles, max_per_object=3):
+    examples = []
+
+    for oid, data in lifecycles.items():
+        acts = data["activities"]
+
+        for i in range(min(len(acts) - 1, max_per_object)):
+            act1, act2 = acts[i], acts[i + 1]
+
+            q_template = random.choice(QUESTION_TEMPLATES["next_step"])
+            q = q_template.format(obj=oid, act=act1)
+
+            examples.append({
+                "anchor_oid": oid,
+                "object_type": data["object_type"],
+                "question_family": "next_step",
+                "question": q,
+                "gold_paths": [acts],
+                "gold_answer": act2,
+                "behaviorally_valid": True
+            })
+
+    return examples
+
+def generate_counterfactual_examples(lifecycles, all_activities, max_per_object=2):
+    examples = []
+
+    for oid, data in lifecycles.items():
+        acts = data["activities"]
+
+        invalid_candidates = list(set(all_activities) - set(acts))
+        if not invalid_candidates:
+            continue
+
+        for _ in range(min(max_per_object, len(acts) - 1)):
+            act1 = random.choice(acts[:-1])
+            act2 = random.choice(invalid_candidates)
+
+            q_template = random.choice(QUESTION_TEMPLATES["counterfactual"])
+            q = q_template.format(
+                obj=oid,
+                act1=act1,
+                act2=act2
+            )
+
+            examples.append({
+                "anchor_oid": oid,
+                "object_type": data["object_type"],
+                "question_family": "counterfactual",
+                "question": q,
+                "gold_paths": [acts],
+                "gold_answer": "No",
+                "behaviorally_valid": False
+            })
+
+    return examples
+
+def extract_context_snapshot(G_context, oid, max_depth=1):
     """
-    Sample *num* event nodes so that every activity type appears at least once.
-    Falls back to uniform random sampling once all activity types are covered.
+    Extract a small ego-graph around the anchor object.
     """
-    events = [n for n in G.nodes if G.nodes[n].get("entity_type") == "Event"]
-    if not events:
-        return []
+    nodes = set([oid])
+    frontier = set([oid])
 
-    by_activity: Dict[str, List[str]] = defaultdict(list)
-    for ev in events:
-        act = G.nodes[ev].get("activity", "Unknown")
-        by_activity[act].append(ev)
+    for _ in range(max_depth):
+        next_frontier = set()
+        for n in frontier:
+            neighbors = G_context.neighbors(n)
+            next_frontier.update(neighbors)
+        nodes.update(next_frontier)
+        frontier = next_frontier
 
-    selected: List[str] = []
-    seen: set = set()
+    subgraph = G_context.subgraph(nodes)
 
-    for act_nodes in by_activity.values():
-        candidate = rng.choice(act_nodes)
-        if candidate not in seen:
-            selected.append(candidate)
-            seen.add(candidate)
-        if len(selected) >= num:
-            break
-
-    remaining = [e for e in events if e not in seen]
-    rng.shuffle(remaining)
-    for e in remaining:
-        if len(selected) >= num:
-            break
-        selected.append(e)
-        seen.add(e)
-
-    return selected[:num]
-
-
-def _stratified_object_sample(
-    G: nx.DiGraph,
-    num: int,
-    rng: random.Random,
-) -> List[str]:
-    """
-    Sample *num* object nodes so that every object type appears at least once.
-    """
-    objects = [n for n in G.nodes if G.nodes[n].get("entity_type") == "Object"]
-    if not objects:
-        return []
-
-    by_type: Dict[str, List[str]] = defaultdict(list)
-    for obj in objects:
-        otype = G.nodes[obj].get("object_type", "Unknown")
-        by_type[otype].append(obj)
-
-    selected: List[str] = []
-    seen: set = set()
-
-    for type_nodes in by_type.values():
-        candidate = rng.choice(type_nodes)
-        if candidate not in seen:
-            selected.append(candidate)
-            seen.add(candidate)
-        if len(selected) >= num:
-            break
-
-    remaining = [o for o in objects if o not in seen]
-    rng.shuffle(remaining)
-    for o in remaining:
-        if len(selected) >= num:
-            break
-        selected.append(o)
-        seen.add(o)
-
-    return selected[:num]
-
-
-# ---------------------------------------------------------------------------
-# Ground-truth path extraction
-# ---------------------------------------------------------------------------
-
-def extract_semantic_paths(
-    G: nx.DiGraph,
-    start_node: str,
-    max_depth: int = 4,
-) -> List[List[tuple]]:
-    """
-    Wrapper around gcr.gcr.extract_paths returning (u, rel, v) triple lists.
-    """
-    return extract_paths(G, start_node, max_depth=max_depth)
-
-
-# ---------------------------------------------------------------------------
-# Question builders
-# ---------------------------------------------------------------------------
-
-def make_local_questions(
-    G: nx.DiGraph,
-    num: int = 100,
-    seed: int = 42,
-    max_gt_paths: int = 10,
-) -> List[Dict]:
-    """
-    Build *num* local event queries.
-
-    Ground-truth paths use linearize_triplets (chain format, underscores),
-    which is identical to what GCRProcessAgent will generate via the trie.
-    """
-    rng = random.Random(seed)
-    sampled_events = _stratified_event_sample(G, num, rng)
-    qs = []
-
-    for i, ev in enumerate(sampled_events):
-        activity = G.nodes[ev].get("activity", "Unknown")
-        q = f"What happens after event {ev}? What objects are involved?"
-
-        gt_paths = [
-            linearize_triplets(G, p)
-            for p in extract_semantic_paths(G, ev, max_depth=3)
+    return {
+        "nodes": [
+            {"id": n, **subgraph.nodes[n]}
+            for n in subgraph.nodes
+        ],
+        "edges": [
+            {
+                "source": u,
+                "target": v,
+                **data
+            }
+            for u, v, data in subgraph.edges(data=True)
         ]
+    }
 
-        linked_objs = [
-            obj
-            for _, obj, _ in G.out_edges(ev, data=True)
-            if G.nodes[obj].get("entity_type") == "Object"
-        ]
+def build_evaluation_dataset(
+    ocel,
+    G_context,
+    seed=42
+):
+    random.seed(seed)
 
-        qs.append({
-            "id": f"LOCAL_{i:03d}",
-            "task_type": "local_event_query",
-            "question": q,
-            "topic_entities": [ev],
-            "expected_outputs": {
-                "paths": gt_paths[:max_gt_paths],
-                "answer": {
-                    "activity": activity,
-                    "objects": linked_objs,
-                },
+    lifecycles = extract_object_lifecycles(ocel)
+    all_activities = list(set(ocel.events["ocel:activity"]))
+
+    positives = generate_positive_examples(lifecycles)
+    negatives = generate_counterfactual_examples(lifecycles, all_activities)
+
+    dataset = []
+    counter = 0
+
+    for ex in positives + negatives:
+        instance_id = f"{ex['anchor_oid']}_{counter}"
+        counter += 1
+
+        context = extract_context_snapshot(
+            G_context,
+            ex["anchor_oid"]
+        )
+
+        dataset.append({
+            "instance_id": instance_id,
+            "anchor_object": {
+                "oid": ex["anchor_oid"],
+                "type": ex["object_type"]
             },
+            "question_family": ex["question_family"],
+            "question": ex["question"],
+            "gold_paths": [ex["gold_paths"]],
+            "gold_answer": ex["gold_answer"],
+            "behaviorally_valid": ex["behaviorally_valid"],
+            "context_snapshot": context
         })
 
-    return qs
+    return dataset
 
+"""
+eval/sample_dataset.py
+----------------------
+Stratified sampler for the OCEL process-mining evaluation framework.
+ 
+Takes the full dataset produced by build_evaluation_dataset() and draws a
+fixed-size stratified sample that is balanced across:
+  - question_family  (next_step, counterfactual)
+  - object_type      (purchase_order, goods_receipt, …)
+ 
+The sample is serialised as a JSON file so every downstream script (path
+generation, scoring) operates on the *same* fixed question set — a
+prerequisite for reproducible academic comparison.
+ 
+Usage
+-----
+    python -m eval.sample_dataset \
+        --ocel  data/ocel2-p2p.json \
+        --graph graphs/context_graph.graphml \
+        --out   eval/sampled_100.json \
+        --n     100 \
+        --seed  42
 
-def make_local_object_questions(
-    G: nx.DiGraph,
-    num: int = 100,
-    seed: int = 42,
-    max_gt_paths: int = 10,
-) -> List[Dict]:
-    """
-    Build *num* local object lifecycle queries.
-    """
-    rng = random.Random(seed)
-    sampled_objects = _stratified_object_sample(G, num, rng)
-    qs = []
-
-    for i, obj in enumerate(sampled_objects):
-        otype = G.nodes[obj].get("object_type", "Unknown")
-        q = f"What are the events associated with object {obj}? Describe its lifecycle."
-
-        events = list({
-            u
-            for u, _, _ in G.in_edges(obj, data=True)
-            if G.nodes[u].get("entity_type") == "Event"
-        } | {
-            v
-            for _, v, _ in G.out_edges(obj, data=True)
-            if G.nodes[v].get("entity_type") == "Event"
-        })
-
-        sem_paths = [
-            linearize_triplets(G, p)
-            for p in extract_semantic_paths(G, obj, max_depth=4)
-        ]
-
-        qs.append({
-            "id": f"OBJ_{i:03d}",
-            "task_type": "local_object_query",
-            "question": q,
-            "topic_entities": [obj],
-            "expected_outputs": {
-                "paths": sem_paths[:max_gt_paths],
-                "answer": {
-                    "object_type": otype,
-                    "events": events,
-                    "num_events": len(events),
-                },
-            },
-        })
-
-    return qs
-
-
+            python -m eval.sample_dataset --ocel  data/ocel2-p2p.json --graph graphs/context_graph.graphml --out eval/sampled_100.json --n 100 --seed  42
+"""
+ 
+ 
 # ---------------------------------------------------------------------------
-# Dataset builder
+# Stratified sampler
 # ---------------------------------------------------------------------------
-
-def build_all_datasets(
-    G_ocel: nx.DiGraph,
-    out_prefix: str = "eval",
-    num_local: int = 100,
-    num_object: int = 100,
+ 
+def stratified_sample(
+    dataset: List[Dict[str, Any]],
+    n: int = 100,
     seed: int = 42,
-) -> None:
+) -> List[Dict[str, Any]]:
     """
-    Write eval_local.jsonl and eval_localobj.jsonl to disk.
-
+    Draw *n* instances from *dataset* with stratification over the
+    cross-product of (question_family × object_type).
+ 
+    If a stratum has fewer items than its fair share, all items in that
+    stratum are kept and the deficit is redistributed proportionally to
+    larger strata — ensuring exactly *n* items are returned whenever
+    ``len(dataset) >= n``.
+ 
     Parameters
     ----------
-    seed : Random seed — document this value in the thesis methods section
-           for full reproducibility.
+    dataset : full dataset from build_evaluation_dataset()
+    n       : target sample size
+    seed    : random seed for reproducibility (reported in paper)
+ 
+    Returns
+    -------
+    List[Dict] — sampled instances, each augmented with a ``sample_id``
+    field (zero-padded index within the sample, e.g. "Q000"…"Q099").
     """
-    local = make_local_questions(G_ocel, num=num_local, seed=seed)
-    localobj = make_local_object_questions(G_ocel, num=num_object, seed=seed)
-
-    local_path = f"eval/data/{out_prefix}_local.jsonl"
-    obj_path = f"eval/data/{out_prefix}_localobj.jsonl"
-
-    with open(local_path, "w") as f:
-        for q in local:
-            f.write(json.dumps(q) + "\n")
-
-    with open(obj_path, "w") as f:
-        for q in localobj:
-            f.write(json.dumps(q) + "\n")
-
-    print(f"Datasets generated (seed={seed}):")
-    print(f"  {local_path}  ({len(local)} questions)")
-    print(f"  {obj_path}  ({len(localobj)} questions)")
+    rng = random.Random(seed)
+ 
+    # ---- group by stratum key ----
+    strata: Dict[str, List[Dict]] = defaultdict(list)
+    for item in dataset:
+        family = item.get("question_family", "unknown")
+        obj_type = item.get("anchor_object", {}).get("type", "unknown")
+        key = f"{family}__{obj_type}"
+        strata[key].append(item)
+ 
+    # Shuffle each stratum independently (reproducibly)
+    for key in strata:
+        rng.shuffle(strata[key])
+ 
+    num_strata = len(strata)
+    base_per_stratum = n // num_strata
+    remainder = n % num_strata
+ 
+    # Sort strata keys for determinism
+    sorted_keys = sorted(strata.keys())
+ 
+    selected: List[Dict] = []
+    shortfall = 0
+ 
+    # First pass: collect min(base_per_stratum, stratum_size) per stratum
+    quotas: Dict[str, int] = {}
+    for i, key in enumerate(sorted_keys):
+        quota = base_per_stratum + (1 if i < remainder else 0)
+        actual = min(quota, len(strata[key]))
+        quotas[key] = actual
+        shortfall += quota - actual
+ 
+    # Second pass: redistribute shortfall to strata with spare capacity
+    if shortfall > 0:
+        for key in sorted_keys:
+            spare = len(strata[key]) - quotas[key]
+            take = min(spare, shortfall)
+            quotas[key] += take
+            shortfall -= take
+            if shortfall == 0:
+                break
+ 
+    # Collect according to quotas
+    for key in sorted_keys:
+        selected.extend(strata[key][:quotas[key]])
+ 
+    # Shuffle the final sample so families are interleaved
+    rng.shuffle(selected)
+ 
+    # Assign stable sample IDs
+    for i, item in enumerate(selected):
+        item["sample_id"] = f"Q{i:03d}"
+ 
+    return selected
+ 
+ 
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+ 
+def main():
+    parser = argparse.ArgumentParser(
+        description="Build and stratified-sample the GCR/RAG evaluation dataset."
+    )
+    parser.add_argument("--ocel",  default="data/ocel2-p2p.json",
+                        help="Path to the OCEL 2.0 JSON log.")
+    parser.add_argument("--graph", default="test2.graphml",
+                        help="Path to the GraphML process graph.")
+    parser.add_argument("--out",   default="eval/data/sampled_100.json",
+                        help="Output path for the sampled dataset JSON.")
+    parser.add_argument("--n",     type=int, default=100,
+                        help="Number of evaluation instances (default: 100).")
+    parser.add_argument("--seed",  type=int, default=42,
+                        help="Random seed (default: 42, reported in paper).")
+    args = parser.parse_args()
+ 
+    # 1. Load OCEL log and graph
+    print(f"Loading OCEL log: {args.ocel}")
+    ocel = pm4py.read_ocel2(args.ocel)
+ 
+    print(f"Loading process graph: {args.graph}")
+    G = load_graphml_to_networkx(args.graph)
+ 
+    # 2. Build the full dataset
+    print("Building full evaluation dataset…")
+    full_dataset = build_evaluation_dataset(ocel, G, seed=args.seed)
+    print(f"Full dataset size: {len(full_dataset)} instances")
+ 
+    # 3. Stratified sample
+    print(f"Sampling {args.n} instances (seed={args.seed})…")
+    sample = stratified_sample(full_dataset, n=args.n, seed=args.seed)
+    print(f"Sampled {len(sample)} instances")
+ 
+    # 4. Report stratum breakdown (useful for paper's Table 1)
+    family_counts: Dict[str, int] = defaultdict(int)
+    type_counts:   Dict[str, int] = defaultdict(int)
+    for item in sample:
+        family_counts[item["question_family"]] += 1
+        type_counts[item["anchor_object"]["type"]] += 1
+ 
+    print("\n=== Stratum breakdown ===")
+    print("By question family:")
+    for k, v in sorted(family_counts.items()):
+        print(f"  {k:30s} {v:4d}")
+    print("By object type:")
+    for k, v in sorted(type_counts.items()):
+        print(f"  {k:30s} {v:4d}")
+ 
+    # 5. Serialise
+    import os
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(sample, f, indent=2, default=str)
+    print(f"\nSaved {len(sample)} instances → {args.out}")
+ 
+ 
+if __name__ == "__main__":
+    main()

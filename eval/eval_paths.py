@@ -74,7 +74,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from eval2.metrics import (
+from rabotest.eval.metrics import (
     best_path_metrics,
     calculate_path_metrics,
     load_jsonl,
@@ -138,7 +138,7 @@ def score_paths_directly(
             for b in beams
         ]
         #scores["path_recall"] = calculate_path_recall(normalized_beams, gold_paths)
-        best_precision, best_recall, avg_precision, avg_recall, best_f1, avg_f1, best_lcs, avg_lcs = best_path_metrics(normalized_beams, gold_paths[0][0])
+        best_precision, best_recall, best_f1, best_lcs, avg_precision, avg_recall, avg_f1, avg_lcs = best_path_metrics(normalized_beams, gold_paths[0][0])
         scores["path_recall"] = best_recall  # or avg_recall, depending on your preference
         scores["path_precision"] = best_precision  # or avg_precision
         scores["path_f1"] = best_f1  # or avg_f1
