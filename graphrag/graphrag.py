@@ -39,24 +39,6 @@ def build_graphrag_llm(
     max_new_tokens: int = 512,
     device_map: str = "auto",
 ):
-    """
-    Instantiate and return an LLM callable for GraphRAG generation.
-
-    Parameters
-    ----------
-    backend:
-        "hf" for a local HuggingFace model, "openai" for the OpenAI API.
-    model:
-        Model identifier passed to the chosen backend.
-    max_new_tokens:
-        Maximum tokens to generate (HuggingFace only).
-    device_map:
-        Passed to transformers pipeline (HuggingFace only).
-
-    Returns
-    -------
-    A callable that accepts a prompt string and returns a response string.
-    """
     if backend == "hf":
         from transformers import pipeline as hf_pipeline
 
@@ -68,15 +50,18 @@ def build_graphrag_llm(
             device_map=device_map,
         )
 
-        def _hf_generate(prompt: str) -> str:
-            # transformers pipeline returns a list of dicts;
-            # [0]["generated_text"] contains the full string including the prompt.
+        def _hf_generate(prompt: str) -> tuple[str, dict]:
             output = pipe(prompt)
             generated = output[0]["generated_text"]
-            # Strip the prompt prefix so only the new text is returned.
             if generated.startswith(prompt):
                 generated = generated[len(prompt):]
-            return generated.strip()
+            # HF pipelines don't expose token counts natively;
+            # return None so aggregate() skips these via the NaN guard
+            token_meta = {
+                "prompt_tokens_answer": None,
+                "completion_tokens":    None,
+            }
+            return generated.strip(), token_meta
 
         print("[GraphRAG] HuggingFace model ready.")
         return _hf_generate
@@ -86,28 +71,40 @@ def build_graphrag_llm(
 
         print(f"[GraphRAG] Using OpenAI model: {model}")
 
-        def _openai_generate(prompt: str) -> str:
+        def _openai_generate(prompt: str) -> tuple[str, dict]:
             response = openai.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user",   "content": prompt},
+                ]
             )
-            return response.choices[0].message.content or ""
+            token_meta = {
+                "prompt_tokens_answer": response.usage.prompt_tokens,
+                "completion_tokens":    response.usage.completion_tokens,
+            }
+            return response.choices[0].message.content or "", token_meta
 
         return _openai_generate
 
     raise ValueError(
         f"Unknown LLM backend '{backend}'. Choose from: 'hf' | 'openai'"
     )
-
-
 # ---------------------------------------------------------------------------
 # Context builder
 # ---------------------------------------------------------------------------
 
-def _build_context(graph: nx.DiGraph, entity_id: str) -> str:
+def _build_context(graph: nx.DiGraph, entity_id: str, max_hops: int = 1) -> str:
     """
-    Build a structured text context from the 1-hop neighbourhood of
-    *entity_id* in *graph*.  Returns an empty string if the node is absent.
+    Build a structured text context from the n-hop neighbourhood of
+    *entity_id* in *graph* using BFS. Returns an empty string if the
+    node is absent.
+
+    Parameters
+    ----------
+    max_hops : int
+        Neighbourhood depth. 1 = direct neighbours only (original behaviour),
+        2-3 = wider process context at the cost of more tokens.
     """
     if entity_id not in graph.nodes:
         return ""
@@ -122,41 +119,55 @@ def _build_context(graph: nx.DiGraph, entity_id: str) -> str:
         if k not in ("entity_type", "label"):
             lines.append(f" - {k}: {v}")
 
-    # 1-hop neighbours
-    lines.append("\nDIRECTLY LINKED ENTITIES:")
-    neighbors = list(graph.neighbors(entity_id))
+    # BFS up to max_hops
+    visited = {entity_id}
+    # queue entries: (node_id, depth)
+    queue = [(entity_id, 0)]
 
-    if not neighbors:
-        lines.append(" (No connections found)")
+    while queue:
+        current, depth = queue.pop(0)
+        if depth >= max_hops:
+            continue
 
-    for neighbor in neighbors:
-        edge_data = graph.get_edge_data(entity_id, neighbor)
-        neighbor_attrs = graph.nodes[neighbor]
-        rel_type = edge_data.get("label", "related_to")
+        neighbors = list(graph.neighbors(current))
+        if not neighbors:
+            continue
 
-        if rel_type == "NEXT_EVENT":
-            act = neighbor_attrs.get("activity", "Unknown")
-            time = neighbor_attrs.get("timestamp", "")
-            lines.append(
-                f" -> [NEXT_EVENT] -> {neighbor} (Activity: '{act}' at {time})"
-            )
-        else:
-            obj_type = neighbor_attrs.get("object_type", "Object")
-            lines.append(
-                f" -> [{rel_type}] -> {neighbor} (Type: {obj_type})"
-            )
+        hop_label = "DIRECTLY LINKED" if depth == 0 else f"HOP-{depth + 1} ENTITIES"
+        lines.append(f"\n{hop_label} (from {current}):")
+
+        for neighbor in neighbors:
+            edge_data = graph.get_edge_data(current, neighbor)
+            neighbor_attrs = graph.nodes[neighbor]
+            rel_type = edge_data.get("label", "related_to")
+
+            if rel_type == "NEXT_EVENT":
+                act = neighbor_attrs.get("activity", "Unknown")
+                ts  = neighbor_attrs.get("timestamp", "")
+                lines.append(
+                    f" -> [NEXT_EVENT] -> {neighbor} (Activity: '{act}' at {ts})"
+                )
+            else:
+                obj_type = neighbor_attrs.get("object_type", "Object")
+                lines.append(
+                    f" -> [{rel_type}] -> {neighbor} (Type: {obj_type})"
+                )
+
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append((neighbor, depth + 1))
 
     return "\n".join(lines)
-
 
 # ---------------------------------------------------------------------------
 # Main search function
 # ---------------------------------------------------------------------------
 
 _GRAPHRAG_PROMPT_TEMPLATE = """\
-You are a Process Mining AI assistant specialising in Procure-to-Pay (P2P) event logs.
-Answer the question strictly using the provided Graph Context below.
+You are a process mining assistant specialising in Procure-to-Pay (P2P) event logs.
+Answer the question using ONLY the context provided below.
 If the context does not contain enough information, say so explicitly.
+Keep your answer concise - one or two sentences.
 
 GRAPH CONTEXT:
 {context}
@@ -173,6 +184,7 @@ def perform_local_search(
     llm=None,
     backend: LLMBackend = "hf",
     model: str = "Qwen/Qwen2.5-7B-Instruct",
+    max_hops: int = 1, 
 ) -> str:
     """
     Perform a GraphRAG local search on *entity_id* and return the LLM answer.
@@ -204,7 +216,7 @@ def perform_local_search(
     if entity_id not in graph.nodes:
         return f"Error: Entity '{entity_id}' not found in the graph."
 
-    context = _build_context(graph, entity_id)
+    context = _build_context(graph, entity_id, max_hops)
 
     prompt = _GRAPHRAG_PROMPT_TEMPLATE.format(
         context=context,
@@ -214,4 +226,5 @@ def perform_local_search(
     if llm is None:
         llm = build_graphrag_llm(backend=backend, model=model)
 
-    return llm(prompt)
+    answer, token_meta = llm(prompt)
+    return answer, token_meta, context

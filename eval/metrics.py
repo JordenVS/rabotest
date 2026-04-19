@@ -378,15 +378,15 @@ def aggregate(scored: List[Dict]) -> Dict[str, Dict[str, float]]:
         # }
         results[system] = {
             "n":              len(recs),
+            "em":             _mean("em"),
             "path_recall":             _mean("path_recall"),
             "path_precision":         _mean("path_precision"),
             "path_f1":        _mean("path_f1"),
             "lcs_recall":            _mean("lcs_recall"),
-            # "path_recall":    _mean("path_recall"),
-            # "path_precision": _mean("path_precision"),
-            # "cf_acc":         _mean("cf_acc"),
-            # "lat_mean_s":     _mean("answer_s"),
-            # "lat_p95_s":      _p95("answer_s"),
+            "lat_mean_s":     _mean("answer_s"),
+            "lat_p95_s":      _p95("answer_s"),
+            "prompt_tokens_mean":     _mean("prompt_tokens_answer"),
+            "completion_tokens_mean": _mean("completion_tokens"),
         }
     return results
 
@@ -398,8 +398,8 @@ def aggregate(scored: List[Dict]) -> Dict[str, Dict[str, float]]:
 # PATH_METRIC_COLS    = ["n", "em", "tok_f1", "rouge_l", "mrr",
 #                        "path_recall", "path_precision"]
 PATH_METRIC_COLS    = ["n", "path_recall", "path_precision", "path_f1", "lcs_recall"]
-ANSWER_METRIC_COLS  = ["n", "em", "tok_f1", "rouge_l", "mrr",
-                       "cf_acc", "lat_mean_s", "lat_p95_s"]
+ANSWER_METRIC_COLS  = ["em", "prompt_tokens_mean", "completion_tokens_mean",
+    "lat_mean_s", "lat_p95_s"]
 ALL_METRIC_COLS     = ["n", "em", "tok_f1", "rouge_l", "mrr",
                        "path_recall", "path_precision", "cf_acc",
                        "lat_mean_s", "lat_p95_s"]

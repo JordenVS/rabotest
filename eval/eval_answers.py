@@ -88,7 +88,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from eval2.metrics import (
+from eval.metrics import (
     load_jsonl,
     load_dataset,
     load_done,
@@ -142,7 +142,7 @@ def generate_gcr_answer(
     record: Dict,
     question: str,
     llm,
-) -> Tuple[str, float]:
+) -> Tuple[str, float, dict, str]:
     """
     Build the LLM prompt from the predicted paths and any enriched context,
     then call the LLM.
@@ -169,20 +169,22 @@ def generate_gcr_answer(
 
     prompt = _build_answer_prompt(context, question)
     t0 = time.perf_counter()
-    answer = llm(prompt)
+    answer, token_meta = llm(prompt)
     elapsed = time.perf_counter() - t0
-    return answer, elapsed
+    return answer, elapsed, token_meta, context
 
 
-def generate_rag_answer(
-    question: str,
-    rag_chain,
-) -> Tuple[str, float]:
+def generate_rag_answer(question, rag_chain) -> Tuple[str, float, dict, str]:
+    from rag.rag import TokenUsageCallback
+    callback = TokenUsageCallback()
     t0 = time.perf_counter()
-    print(f"Generating RAG answer for question: {question}")
-    result = rag_chain.invoke({"question": question})
+    result = rag_chain.invoke(
+        {"question": question},
+        config={"callbacks": [callback]},
+    )
+    context = result.get("context", "")
     elapsed = time.perf_counter() - t0
-    return result.get("answer", ""), elapsed
+    return result.get("answer", ""), elapsed, callback.last_token_meta, context
 
 
 def generate_graphrag_answer(
@@ -190,12 +192,12 @@ def generate_graphrag_answer(
     anchor_oid: str,
     graph,
     graphrag_llm,
-) -> Tuple[str, float]:
+) -> Tuple[str, float, dict, str]:
     from graphrag.graphrag import perform_local_search
     t0 = time.perf_counter()
-    answer = perform_local_search(graph, anchor_oid, question, llm=graphrag_llm)
+    answer, token_meta, context = perform_local_search(graph, anchor_oid, question, llm=graphrag_llm, max_hops=2)
     elapsed = time.perf_counter() - t0
-    return answer, elapsed
+    return answer, elapsed, token_meta, context
 
 
 # ===========================================================================
@@ -265,7 +267,11 @@ def build_llm_openai(model: str, device: str = "cpu", max_new_tokens: int = 256)
                 max_tokens=max_new_tokens,
                 temperature=0.0,
             )
-            return response.choices[0].message.content.strip()
+            token_meta = {
+                    "prompt_tokens_answer":  response.usage.prompt_tokens,
+                    "completion_tokens":     response.usage.completion_tokens,
+                }
+            return response.choices[0].message.content.strip(), token_meta
         except Exception as e:
             print(f"API Error: {e}")
             return ""
@@ -414,7 +420,7 @@ def run_answer_evaluation(args: argparse.Namespace) -> None:
                 if system == "gcr_constrained":
                     path_rec   = constrained_index.get(instance_id, {})
                     beams      = path_rec.get("paths", [])
-                    prediction, answer_s = generate_gcr_answer(
+                    prediction, answer_s, token_meta, context = generate_gcr_answer(  
                         path_rec, question_text, llm
                     )
                     extra = {
@@ -422,35 +428,39 @@ def run_answer_evaluation(args: argparse.Namespace) -> None:
                         "generation_s": path_rec.get("generation_s", 0.0),
                         "enrich_s":     path_rec.get("enrich_s", 0.0),
                         "path_total_s": path_rec.get("total_s", 0.0),
+                        **token_meta,
                     }
 
                 elif system == "gcr_unconstrained":
                     path_rec   = unconstrained_index.get(instance_id, {})
                     beams      = path_rec.get("paths", [])
-                    prediction, answer_s = generate_gcr_answer(
+                    prediction, answer_s, token_meta, context = generate_gcr_answer(  
                         path_rec, question_text, llm
                     )
                     extra = {
                         "generation_s": path_rec.get("generation_s", 0.0),
                         "path_total_s": path_rec.get("total_s", 0.0),
+                        **token_meta,
                     }
 
                 elif system == "rag":
-                    prediction, answer_s = generate_rag_answer(
+                    prediction, answer_s, token_meta, context = generate_rag_answer(  
                         question_text, rag_chain
                     )
                     beams = [prediction]
+                    extra = {**token_meta}
 
                 elif system == "graphrag":
                     if anchor_oid and graph is not None:
-                        prediction, answer_s = generate_graphrag_answer(
+                        prediction, answer_s, token_meta, context = generate_graphrag_answer(  
                             question_text, anchor_oid, graph, graphrag_llm
                         )
                     else:
                         prediction = ""
                         answer_s   = 0.0
+                        token_meta = {"prompt_tokens_answer": None, "completion_tokens": None}
                     beams = [prediction]
-
+                    extra = {**token_meta}
             except Exception as exc:
                 print(f"\n  [WARNING] {instance_id} / {system}: {exc}", flush=True)
                 prediction = ""
@@ -467,6 +477,7 @@ def run_answer_evaluation(args: argparse.Namespace) -> None:
                 "question":        question_text,
                 "gold_answer":     gold_answer,
                 "prediction":      prediction,
+                "context":         context,
                 "answer_s":        answer_s,
                 **metrics,
                 **extra,

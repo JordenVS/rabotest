@@ -63,6 +63,8 @@ import argparse
 import os
 import sys
 from typing import Dict, List, Optional, Tuple
+import numpy as np
+import json
 
 from tqdm import tqdm
 
@@ -74,7 +76,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from rabotest.eval.metrics import (
+from eval.metrics import (
     best_path_metrics,
     calculate_path_metrics,
     load_jsonl,
@@ -162,6 +164,39 @@ def score_paths_directly(
     #     )
 
     return prediction, scores
+
+def calculate_efficiency_metrics(file_path):
+    with open(file_path, 'r') as f:
+        # Assuming the file is a list of JSON objects
+        data = json.load(f)
+
+    # Initialize lists for each metric
+    trie_times = []
+    path_gen_times = []
+    enrich_times = []
+    total_times = []
+
+    for entry in data:
+        trie_times.append(entry.get('trie_build_s', 0))
+        path_gen_times.append(entry.get('generation_s', 0))
+        enrich_times.append(entry.get('enrich_s', 0))
+        total_times.append(entry.get('total_s', 0))
+
+    metrics = {
+        "Trie Construction": trie_times,
+        "Path Generation": path_gen_times,
+        "Context Enrichment": enrich_times,
+        "Total Pipeline": total_times
+    }
+
+    print(f"{'Metric':<20} | {'Mean (s)':<10} | {'P95 (s)':<10}")
+    print("-" * 46)
+    
+    for name, values in metrics.items():
+        mean_val = np.mean(values)
+        p95_val = np.percentile(values, 95)
+        print(f"{name:<20} | {mean_val:<10.4f} | {p95_val:<10.4f}")
+
 
 
 # ===========================================================================

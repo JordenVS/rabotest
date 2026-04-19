@@ -13,3 +13,5 @@ results_mini*
 results_d*/
 eval/data
 paths_*
+final_results/
+results_judge*
