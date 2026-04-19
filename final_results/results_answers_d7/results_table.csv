@@ -1,0 +1,5 @@
+system,n,em,path_recall,path_precision,path_f1,lcs_recall,lat_mean_s,lat_p95_s,prompt_tokens_mean,completion_tokens_mean
+gcr_constrained,100.0,0.8,,,,,1.280165240992792,2.3089297799859194,2790.06,30.7
+gcr_unconstrained,100.0,0.46,,,,,1.043066700026393,1.484810319636017,410.18,29.32
+rag,100.0,0.06,,,,,1.0663226520083844,1.6372029349673536,595.98,28.65
+graphrag,100.0,0.17,,,,,1.111451671011746,1.79390848018229,1203.26,32.03

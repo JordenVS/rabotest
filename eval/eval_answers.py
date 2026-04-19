@@ -105,24 +105,10 @@ from eval.metrics import (
 # LLM answer generation
 # ===========================================================================
 
-# _ANSWER_PROMPT = """\
-# You are a process mining assistant specialising in Procure-to-Pay (P2P) event logs.
-# Answer the question using ONLY the context provided below.
-# If the context does not contain enough information, say so explicitly.
-# Keep your answer concise — one or two sentences.
-
-# ### Context:
-# {context}
-
-# ### Question:
-# {question}
-
-# ### Answer:"""
-
 _ANSWER_PROMPT = """\
 You are a process mining assistant specialising in Procure-to-Pay (P2P) event logs.
-Answer the question using the context provided below.
-Assume the context is accurate and complete, if something is not mentioned in there, it did not happen.
+Answer the question using ONLY the context provided below.
+If the context does not contain enough information, say so explicitly.
 Keep your answer concise — one or two sentences.
 
 ### Context:
@@ -132,6 +118,20 @@ Keep your answer concise — one or two sentences.
 {question}
 
 ### Answer:"""
+
+# _ANSWER_PROMPT = """\
+# You are a process mining assistant specialising in Procure-to-Pay (P2P) event logs.
+# Answer the question using the context provided below.
+# Assume the context is accurate and complete, if something is not mentioned in there, it did not happen.
+# Keep your answer concise — one or two sentences.
+
+# ### Context:
+# {context}
+
+# ### Question:
+# {question}
+
+# ### Answer:"""
 
 
 def _build_answer_prompt(context: str, question: str) -> str:

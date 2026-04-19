@@ -10,13 +10,73 @@ from rag.rag import get_retriever, get_retriever_from_db, create_rag_chain
 #from gcr.trie import ProcessTrie
 import pickle
 import os
+import json
+import numpy as np
 from dotenv import load_dotenv
 
+def calculate_efficiency_metrics(file_path):
+    # Lists to store metrics from each line
+    trie_times = []
+    path_gen_times = []
+    enrich_times = []
+    total_times = []
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue  # Skip empty lines
+                
+                try:
+                    entry = json.loads(line)
+                    
+                    # Extract values, defaulting to 0.0 if key is missing
+                    trie_times.append(entry.get('trie_build_s', 0.0))
+                    path_gen_times.append(entry.get('generation_s', 0.0))
+                    enrich_times.append(entry.get('enrich_s', 0.0))
+                    total_times.append(entry.get('total_s', 0.0))
+                    
+                except json.JSONDecodeError as e:
+                    print(f"Error parsing line {line_num}: {e}")
+                    continue
+
+        if not total_times:
+            print("No data found in the file.")
+            return
+
+        metrics = {
+            "Trie Construction": trie_times,
+            "Path Generation": path_gen_times,
+            "Context Enrichment": enrich_times,
+            "Total Pipeline": total_times
+        }
+
+        print(f"{'Metric':<20} | {'Mean (s)':<10} | {'P95 (s)':<10}")
+        print("-" * 46)
+        
+        for name, values in metrics.items():
+            mean_val = np.mean(values)
+            p95_val = np.percentile(values, 95)
+            print(f"{name:<20} | {mean_val:<10.4f} | {p95_val:<10.4f}")
+
+    except FileNotFoundError:
+        print(f"File not found: {file_path}")
+
+# Usage
+# calculate_efficiency_metrics("paths_news_d3/predicted_paths_constrained.jsonl")
 
 load_dotenv()
 DOCS_CACHE = "cache/pm4py_docs.pkl"
 
 if __name__ == "__main__":
+    calculate_efficiency_metrics("paths_news2_d3/predicted_paths_constrained.jsonl")
+    calculate_efficiency_metrics("paths_news2_d5/predicted_paths_constrained.jsonl")
+    calculate_efficiency_metrics("paths_news2_d7/predicted_paths_constrained.jsonl")
+
+    calculate_efficiency_metrics("paths_news2_d3/predicted_paths_unconstrained.jsonl")
+    calculate_efficiency_metrics("paths_news2_d5/predicted_paths_unconstrained.jsonl")
+    calculate_efficiency_metrics("paths_news2_d7/predicted_paths_unconstrained.jsonl")
     #RECORD_ID = "8412920"
     #download_json_from_zenodo(RECORD_ID, output_dir="./zenodo_json_data")
     #docs = get_docs_extensive("data/ocel2-p2p.json")
@@ -51,7 +111,7 @@ if __name__ == "__main__":
     # print("BGE retriever is ready.")
 
 
-    G_behavior, G_context = build_process_graphs_ocel2("data/ocel2-p2p.json", "graphs/behavior_graph.graphml", "graphs/context_graph.graphml")
+    #G_behavior, G_context = build_process_graphs_ocel2("data/ocel2-p2p.json", "graphs/behavior_graph.graphml", "graphs/context_graph.graphml")
     #ocfg = build_ocdfg_from_ocel2("data/ocel2-p2p.json")
     #docs = get_docs_from_pm4py("data/ocel2-p2p.json")
     #docs.sort(key=lambda d: d.metadata.get("id", ""))

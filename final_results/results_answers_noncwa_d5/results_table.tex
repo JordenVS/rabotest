@@ -1,0 +1,12 @@
+\begin{table}
+\caption{Answer-generation evaluation on 100-instance P2P OCEL benchmark. EM = exact match, MRR = mean reciprocal rank (GCR beams), CF-Acc = counterfactual accuracy, Lat = answer generation latency.}
+\label{tab:answer_results}
+\begin{tabular}{lrrrrrrrrrr}
+\toprule
+system & n & em & path_recall & path_precision & path_f1 & lcs_recall & lat_mean_s & lat_p95_s & prompt_tokens_mean & completion_tokens_mean \\
+\midrule
+gcr_constrained & 100.0000 & 0.6200 & NaN & NaN & NaN & NaN & 1.2029 & 1.9799 & 2357.8700 & 29.0500 \\
+gcr_unconstrained & 100.0000 & 0.1900 & NaN & NaN & NaN & NaN & 0.9733 & 1.4637 & 404.2600 & 26.3800 \\
+\bottomrule
+\end{tabular}
+\end{table}
