@@ -1,71 +1,3 @@
-"""
-eval/eval_answers.py
-====================
-Stage 2b — Answer-generation evaluation for the GCR pipeline.
-
-Loads predicted paths from generate_predicted_paths.py, generates final
-natural-language answers using four systems (GCR-constrained, GCR-unconstrained,
-RAG, GraphRAG), scores them against gold annotations, and writes a results table.
-
-Why a separate script from eval_paths.py?
------------------------------------------
-Answer quality depends on both the path-retrieval step *and* the LLM
-generation step.  Running answer evaluation separately means the GPU model
-only needs to be loaded once for this specific concern, and the results can
-be compared directly with the (LLM-free) path metrics from eval_paths.py to
-isolate where errors originate.
-
-Systems
--------
-gcr_constrained   — constrained GCR paths + enriched object context → LLM
-gcr_unconstrained — unconstrained paths only → LLM
-rag               — FAISS dense retrieval → LLM
-graphrag          — 1-hop subgraph context → LLM
-
-Metrics
--------
-next_step      : EM, token F1, ROUGE-L F1, MRR (over GCR beams)
-counterfactual : Binary accuracy (yes / no polarity)
-all systems    : answer generation latency (mean, p95)
-
-Output files
-------------
-<out_dir>/answers.jsonl          one record per (instance, system)
-<out_dir>/results_table.csv      aggregated per-system metrics
-<out_dir>/results_table.tex      LaTeX table for the paper
-
-Usage
------
-    python -m eval.eval_answers \\
-        --dataset              eval/sampled_100.json \\
-        --constrained_paths    results/predicted_paths_constrained.jsonl \\
-        --unconstrained_paths  results/predicted_paths_unconstrained.jsonl \\
-        --graph_context        graphs/context_graph.graphml \\
-        --faiss_db             faiss_db_bge \\
-        --docs_cache           cache/pm4py_docs.pkl \\
-        --llm_model            Qwen/Qwen2.5-7B-Instruct \\
-        --emb_backend          bge \\
-        --out_dir              results \\
-        --device               cpu
-
-    Quick test (5 instances):
-        --limit 5
-
-    Skip slow systems:
-        --skip_rag --skip_graphrag
-
-References
-----------
-Luo, L., Zhao, Z., Haffari, G., Li, Y.-F., Gong, C., & Pan, S. (2025).
-    Graph-constrained reasoning: Faithful reasoning on knowledge graphs
-    with large language models. ICML 2025.
-Rajpurkar, P., Zhang, J., Lopyrev, K., & Liang, P. (2016).
-    SQuAD: 100,000+ questions for machine comprehension of text. EMNLP.
-Lin, C.-Y. (2004).
-    ROUGE: A package for automatic evaluation of summaries.
-    ACL Workshop on Text Summarisation Branches Out.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -105,24 +37,10 @@ from eval.metrics import (
 # LLM answer generation
 # ===========================================================================
 
-_ANSWER_PROMPT = """\
-You are a process mining assistant specialising in Procure-to-Pay (P2P) event logs.
-Answer the question using ONLY the context provided below.
-If the context does not contain enough information, say so explicitly.
-Keep your answer concise — one or two sentences.
-
-### Context:
-{context}
-
-### Question:
-{question}
-
-### Answer:"""
-
 # _ANSWER_PROMPT = """\
 # You are a process mining assistant specialising in Procure-to-Pay (P2P) event logs.
-# Answer the question using the context provided below.
-# Assume the context is accurate and complete, if something is not mentioned in there, it did not happen.
+# Answer the question using ONLY the context provided below.
+# If the context does not contain enough information, say so explicitly.
 # Keep your answer concise — one or two sentences.
 
 # ### Context:
@@ -132,6 +50,20 @@ Keep your answer concise — one or two sentences.
 # {question}
 
 # ### Answer:"""
+
+_ANSWER_PROMPT = """\
+You are a process mining assistant specialising in Procure-to-Pay (P2P) event logs.
+Answer the question using the context provided below.
+Assume the context is accurate and complete, if something is not mentioned in there, it did not happen.
+Keep your answer concise — one or two sentences.
+
+### Context:
+{context}
+
+### Question:
+{question}
+
+### Answer:"""
 
 
 def _build_answer_prompt(context: str, question: str) -> str:

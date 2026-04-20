@@ -1,6 +1,5 @@
 from __future__ import annotations
 import random
-import uuid
 from collections import defaultdict
 import argparse
 import json

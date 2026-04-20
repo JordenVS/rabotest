@@ -1,62 +1,3 @@
-"""
-eval/eval_paths.py
-==================
-Stage 2a — Path-retrieval evaluation for the GCR pipeline.
-
-Scores the raw beam paths produced by generate_predicted_paths.py directly
-against gold answers and gold path sequences.  No LLM is loaded or called;
-this script completes in seconds and can be run independently of the
-(expensive) answer-generation evaluation in eval_answers.py.
-
-Why a separate script?
-----------------------
-Path-retrieval quality and answer-generation quality are conceptually
-distinct:  one measures whether the constrained decoder finds the correct
-reasoning trace in the graph; the other measures whether the LLM converts
-that trace into a correct natural-language answer.  Separating them makes
-the ablation cleaner and avoids loading a GPU-resident model just to score
-string overlap (Luo et al., 2025, §4.2).
-
-Systems
--------
-gcr_constrained_paths   — constrained GCR beam paths scored against gold
-gcr_unconstrained_paths — unconstrained GCR beam paths scored against gold
-
-Metrics
--------
-next_step : EM, token F1, ROUGE-L F1, MRR (over beams),
-            path_recall, path_precision
-all       : answer_s = 0.0 (no LLM latency)
-
-Output files
-------------
-<out_dir>/path_answers.jsonl     one record per (instance, system)
-<out_dir>/path_results.csv       aggregated metrics
-<out_dir>/path_results.tex       LaTeX table
-
-Usage
------
-    python -m eval.eval_paths \\
-        --dataset             eval/sampled_100.json \\
-        --constrained_paths   results/predicted_paths_constrained.jsonl \\
-        --unconstrained_paths results/predicted_paths_unconstrained.jsonl \\
-        --out_dir             results
-
-    Quick test (5 instances):
-        --limit 5
-
-References
-----------
-Luo, L., Zhao, Z., Haffari, G., Li, Y.-F., Gong, C., & Pan, S. (2025).
-    Graph-constrained reasoning: Faithful reasoning on knowledge graphs
-    with large language models. ICML 2025.
-Rajpurkar, P., Zhang, J., Lopyrev, K., & Liang, P. (2016).
-    SQuAD: 100,000+ questions for machine comprehension of text. EMNLP.
-Lin, C.-Y. (2004).
-    ROUGE: A package for automatic evaluation of summaries.
-    ACL Workshop on Text Summarisation Branches Out.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -78,14 +19,11 @@ if _ROOT not in sys.path:
 
 from eval.metrics import (
     best_path_metrics,
-    calculate_path_metrics,
     load_jsonl,
     load_dataset,
     load_done,
     append_record,
     score_answer,
-    calculate_path_recall,
-    calculate_path_precision,
     aggregate,
     print_results_table,
     write_results_table,

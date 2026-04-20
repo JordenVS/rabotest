@@ -1,32 +1,3 @@
-"""
-eval/metrics.py
-===============
-Shared metric functions and I/O helpers for the GCR evaluation pipeline.
-
-Imported by both eval_paths.py (path-retrieval evaluation) and
-eval_answers.py (answer-generation evaluation).  Keeping metrics in one
-place guarantees that both evaluation scripts score predictions identically,
-which is a basic reproducibility requirement for published results.
-
-Metrics implemented
--------------------
-exact_match       : Rajpurkar et al. (2016) — normalised substring match.
-token_f1          : Rajpurkar et al. (2016) — token-overlap F1.
-rouge_l           : Lin (2004) — longest-common-subsequence F1.
-mrr               : Mean Reciprocal Rank over a ranked beam list.
-counterfactual_acc: Binary yes/no polarity accuracy.
-path_recall       : Fraction of gold activity sequences recovered in beams.
-path_precision    : Fraction of beams that contain at least one gold activity.
-
-References
-----------
-Rajpurkar, P., Zhang, J., Lopyrev, K., & Liang, P. (2016).
-    SQuAD: 100,000+ questions for machine comprehension of text. EMNLP.
-Lin, C.-Y. (2004).
-    ROUGE: A package for automatic evaluation of summaries.
-    ACL Workshop on Text Summarisation Branches Out.
-"""
-
 from __future__ import annotations
 
 import json
@@ -364,18 +335,6 @@ def aggregate(scored: List[Dict]) -> Dict[str, Dict[str, float]]:
             ]
             return float(np.percentile(vals, 95)) if vals else float("nan")
 
-        # results[system] = {
-        #     "n":              len(recs),
-        #     "em":             _mean("em"),
-        #     "tok_f1":         _mean("tok_f1"),
-        #     "rouge_l":        _mean("rouge_l"),
-        #     "mrr":            _mean("mrr"),
-        #     "path_recall":    _mean("path_recall"),
-        #     "path_precision": _mean("path_precision"),
-        #     "cf_acc":         _mean("cf_acc"),
-        #     "lat_mean_s":     _mean("answer_s"),
-        #     "lat_p95_s":      _p95("answer_s"),
-        # }
         results[system] = {
             "n":              len(recs),
             "em":             _mean("em"),
@@ -395,8 +354,6 @@ def aggregate(scored: List[Dict]) -> Dict[str, Dict[str, float]]:
 # Results reporting  (shared table printer + CSV/LaTeX writer)
 # ===========================================================================
 
-# PATH_METRIC_COLS    = ["n", "em", "tok_f1", "rouge_l", "mrr",
-#                        "path_recall", "path_precision"]
 PATH_METRIC_COLS    = ["n", "path_recall", "path_precision", "path_f1", "lcs_recall"]
 ANSWER_METRIC_COLS  = ["em", "prompt_tokens_mean", "completion_tokens_mean",
     "lat_mean_s", "lat_p95_s"]
