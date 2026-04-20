@@ -16,3 +16,5 @@ paths_*
 results_judge_d3_t*
 *.ipynb
 old_results/
+data/
+cache/
