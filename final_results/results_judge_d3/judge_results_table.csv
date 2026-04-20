@@ -1,0 +1,5 @@
+system,n,correctness,faithfulness,hallucination_rate,judge_prompt_tokens_mean
+gcr_constrained,100.0,0.59,0.92,0.07999999999999996,240.28
+gcr_unconstrained,100.0,0.28,0.81,0.18999999999999995,237.07
+rag,100.0,0.0,0.87,0.13,237.62
+graphrag,100.0,0.1,0.89,0.10999999999999999,240.36

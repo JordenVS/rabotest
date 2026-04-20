@@ -89,6 +89,21 @@ def _build_embeddings(backend: EmbeddingBackend):
         encode_kwargs=cfg.get("encode_kwargs", {})
     )
 
+from langchain_core.callbacks.base import BaseCallbackHandler
+
+class TokenUsageCallback(BaseCallbackHandler):
+    """Captures token usage from the last LLM call in a RAG chain."""
+    def __init__(self):
+        self.last_token_meta = {}
+
+    def on_llm_end(self, response, **kwargs):
+        # LangChain surfaces OpenAI usage in response.llm_output
+        usage = response.llm_output.get("token_usage", {})
+        self.last_token_meta = {
+            "prompt_tokens_answer": usage.get("prompt_tokens"),
+            "completion_tokens":    usage.get("completion_tokens"),
+        }
+
 # ---------------------------------------------------------------------------
 # Vectorstore helpers
 # ---------------------------------------------------------------------------
@@ -194,8 +209,9 @@ def _build_llm(backend: LLMBackend, model: str, **kwargs):
 
 _RAG_PROMPT = ChatPromptTemplate.from_template(
     """You are a process mining assistant specialising in Procure-to-Pay (P2P) event logs.
-Answer the question using ONLY the retrieved context below.
+Answer the question using ONLY the context provided below.
 If the context does not contain enough information, say so explicitly.
+Keep your answer concise - one or two sentences.
 
 Context:
 {context}

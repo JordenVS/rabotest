@@ -1,0 +1,14 @@
+\begin{table}
+\caption{LLM-as-a-judge evaluation on P2P OCEL benchmark. Correctness = fraction of predictions judged semantically correct by GPT-4o-mini vs. gold answer. Faithfulness = fraction of predictions containing no hallucinated claims relative to the provided context. Hallucination rate = 1 - Faithfulness.}
+\label{tab:judge_results}
+\begin{tabular}{lrrrrr}
+\toprule
+system & n & correctness & faithfulness & hallucination_rate & judge_prompt_tokens_mean \\
+\midrule
+gcr_constrained & 100.0000 & 0.6400 & 0.8200 & 0.1800 & 239.2300 \\
+gcr_unconstrained & 100.0000 & 0.3300 & 0.8100 & 0.1900 & 237.8500 \\
+rag & 100.0000 & 0.0000 & 0.8400 & 0.1600 & 237.1800 \\
+graphrag & 100.0000 & 0.1000 & 0.9100 & 0.0900 & 240.5600 \\
+\bottomrule
+\end{tabular}
+\end{table}

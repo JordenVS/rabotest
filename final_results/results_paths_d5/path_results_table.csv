@@ -1,0 +1,3 @@
+system,n,em,path_recall,path_precision,path_f1,lcs_recall,lat_mean_s,lat_p95_s,prompt_tokens_mean,completion_tokens_mean
+gcr_constrained_paths,100.0,0.0,0.8536666666666668,0.715,0.7224444444444444,0.8790039682539682,0.0,0.0,,
+gcr_unconstrained_paths,100.0,0.0,0.005333333333333333,0.00202020202020202,0.002916666666666667,0.4567301587301587,0.0,0.0,,
