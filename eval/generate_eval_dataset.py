@@ -191,33 +191,6 @@ def build_evaluation_dataset(
         })
 
     return dataset
-
-"""
-eval/sample_dataset.py
-----------------------
-Stratified sampler for the OCEL process-mining evaluation framework.
- 
-Takes the full dataset produced by build_evaluation_dataset() and draws a
-fixed-size stratified sample that is balanced across:
-  - question_family  (next_step, counterfactual)
-  - object_type      (purchase_order, goods_receipt, …)
- 
-The sample is serialised as a JSON file so every downstream script (path
-generation, scoring) operates on the *same* fixed question set — a
-prerequisite for reproducible academic comparison.
- 
-Usage
------
-    python -m eval.sample_dataset \
-        --ocel  data/ocel2-p2p.json \
-        --graph graphs/context_graph.graphml \
-        --out   eval/sampled_100.json \
-        --n     100 \
-        --seed  42
-
-            python -m eval.sample_dataset --ocel  data/ocel2-p2p.json --graph graphs/context_graph.graphml --out eval/sampled_100.json --n 100 --seed  42
-"""
- 
  
 # ---------------------------------------------------------------------------
 # Stratified sampler

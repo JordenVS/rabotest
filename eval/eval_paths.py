@@ -86,21 +86,6 @@ def score_paths_directly(
     else:
         scores["path_recall"] = float("nan")
 
-    # # --- Path precision: fraction of beams containing a gold activity ---
-    # if gold_paths and beams:
-    #     scores["path_precision"] = calculate_path_precision(beams, gold_paths)
-    #     print(f"  path_precision = {scores['path_precision']:.4f}")
-    # else:
-    #     scores["path_precision"] = float("nan")
-
-    # # --- Context density: colon count per 100 chars (attribute-density proxy) ---
-    # if context_block:
-    #     total_chars = len(context_block)
-    #     signal_count = context_block.count(":")
-    #     scores["context_density"] = (
-    #         signal_count / (total_chars / 100) if total_chars > 0 else 0.0
-    #     )
-
     return prediction, scores
 
 def calculate_efficiency_metrics(file_path):
