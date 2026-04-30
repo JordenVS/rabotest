@@ -3,7 +3,7 @@ import random
 from collections import defaultdict
 import argparse
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
  
 import pm4py
 import networkx as nx
@@ -275,8 +275,52 @@ def stratified_sample(
         item["sample_id"] = f"Q{i:03d}"
  
     return selected
- 
- 
+
+
+# ---------------------------------------------------------------------------
+# Object-level train/remaining split
+# ---------------------------------------------------------------------------
+
+def split_by_anchor_objects(
+    full_dataset: List[Dict[str, Any]],
+    held_out_sample: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Return all instances from *full_dataset* whose anchor object does NOT
+    appear in *held_out_sample*.
+
+    The exclusion is performed at the object-identifier level (``oid``),
+    guaranteeing zero anchor-object overlap between the training pool and
+    the held-out evaluation set.  This is the standard data-leakage
+    prevention practice for object-centric process mining benchmarks
+    (van der Aalst, 2023): entities seen during evaluation must be
+    entirely absent from the training corpus.
+
+    Parameters
+    ----------
+    full_dataset      : complete dataset produced by build_evaluation_dataset()
+    held_out_sample   : the locked evaluation sample (sampled_100)
+
+    Returns
+    -------
+    List[Dict] — instances eligible for training / further experiments,
+    with an added ``split`` field set to ``"train"``.
+    """
+    # Collect every anchor object identifier that appears in the eval set
+    eval_oids: Set[str] = {
+        item["anchor_object"]["oid"]
+        for item in held_out_sample
+    }
+
+    training_pool = [
+        {**item, "split": "train"}
+        for item in full_dataset
+        if item["anchor_object"]["oid"] not in eval_oids
+    ]
+
+    return training_pool
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -287,7 +331,7 @@ def main():
     )
     parser.add_argument("--ocel",  default="data/ocel2-p2p.json",
                         help="Path to the OCEL 2.0 JSON log.")
-    parser.add_argument("--graph", default="test2.graphml",
+    parser.add_argument("--graph", default="graphs/context_graph.graphml",
                         help="Path to the GraphML process graph.")
     parser.add_argument("--out",   default="eval/data/sampled_100.json",
                         help="Output path for the sampled dataset JSON.")
@@ -295,6 +339,17 @@ def main():
                         help="Number of evaluation instances (default: 100).")
     parser.add_argument("--seed",  type=int, default=42,
                         help="Random seed (default: 42, reported in paper).")
+    parser.add_argument("--full_out", default="eval/data/full_dataset.json",
+                        help="Output path for full dataset JSON.")
+    parser.add_argument("--train_out", default="eval/data/train_dataset.json",
+                        help="Output path for training split JSON "
+                             "(excludes all anchor objects present in sampled_100).")
+    parser.add_argument("--existing_sample", default=None,
+                        help="Path to a pre-existing sampled_100 JSON.  "
+                             "When provided the script skips re-sampling and "
+                             "uses this file as the held-out set for the split, "
+                             "preserving your already-run evaluations.")
+                        
     args = parser.parse_args()
  
     # 1. Load OCEL log and graph
@@ -309,10 +364,28 @@ def main():
     full_dataset = build_evaluation_dataset(ocel, G, seed=args.seed)
     print(f"Full dataset size: {len(full_dataset)} instances")
  
-    # 3. Stratified sample
-    print(f"Sampling {args.n} instances (seed={args.seed})…")
-    sample = stratified_sample(full_dataset, n=args.n, seed=args.seed)
-    print(f"Sampled {len(sample)} instances")
+    # 3. Determine the held-out evaluation sample
+    if args.existing_sample is not None:
+        # ----------------------------------------------------------------
+        # Use the pre-existing sampled_100 that was already evaluated.
+        # This guarantees the training split is computed against exactly
+        # the instances you reported results on, with no re-sampling.
+        # ----------------------------------------------------------------
+        print(f"Loading existing evaluation sample: {args.existing_sample}")
+        with open(args.existing_sample, encoding="utf-8") as f:
+            sample = json.load(f)
+        print(f"Loaded {len(sample)} held-out instances (evaluations preserved)")
+    else:
+        # Fresh run: draw and persist a new stratified sample
+        print(f"Sampling {args.n} instances (seed={args.seed})…")
+        sample = stratified_sample(full_dataset, n=args.n, seed=args.seed)
+        print(f"Sampled {len(sample)} instances")
+
+        import os
+        os.makedirs(os.path.dirname(args.out), exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(sample, f, indent=2, default=str)
+        print(f"Saved {len(sample)} instances → {args.out}")
  
     # 4. Report stratum breakdown (useful for paper's Table 1)
     family_counts: Dict[str, int] = defaultdict(int)
@@ -321,20 +394,41 @@ def main():
         family_counts[item["question_family"]] += 1
         type_counts[item["anchor_object"]["type"]] += 1
  
-    print("\n=== Stratum breakdown ===")
+    print("\n=== Evaluation sample stratum breakdown ===")
     print("By question family:")
     for k, v in sorted(family_counts.items()):
         print(f"  {k:30s} {v:4d}")
     print("By object type:")
     for k, v in sorted(type_counts.items()):
         print(f"  {k:30s} {v:4d}")
- 
-    # 5. Serialise
+
+    # 5. Build object-disjoint training split
+    print("\nBuilding training split (excluding eval anchor objects)…")
+    train_dataset = split_by_anchor_objects(full_dataset, sample)
+
+    eval_oids = {item["anchor_object"]["oid"] for item in sample}
+    train_oids = {item["anchor_object"]["oid"] for item in train_dataset}
+    overlap = eval_oids & train_oids  # must be empty
+    assert len(overlap) == 0, (
+        f"Data-leakage detected: {len(overlap)} anchor objects appear in both "
+        "the evaluation sample and the training split."
+    )
+    print(f"Training split size : {len(train_dataset)} instances")
+    print(f"Unique train objects : {len(train_oids)}")
+    print(f"Unique eval  objects : {len(eval_oids)}")
+    print(f"Anchor-object overlap: {len(overlap)}  ✓")
+
+    # 6. Serialise
     import os
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(sample, f, indent=2, default=str)
-    print(f"\nSaved {len(sample)} instances → {args.out}")
+    os.makedirs(os.path.dirname(args.full_out), exist_ok=True)
+    with open(args.full_out, "w", encoding="utf-8") as f:
+        json.dump(full_dataset, f, indent=2, default=str)
+    print(f"\nSaved {len(full_dataset)} instances → {args.full_out}")
+
+    os.makedirs(os.path.dirname(args.train_out), exist_ok=True)
+    with open(args.train_out, "w", encoding="utf-8") as f:
+        json.dump(train_dataset, f, indent=2, default=str)
+    print(f"Saved {len(train_dataset)} instances → {args.train_out}")
  
  
 if __name__ == "__main__":
