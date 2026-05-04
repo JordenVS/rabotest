@@ -75,6 +75,7 @@ def generate_paths(
     G_context: nx.DiGraph,
     num_paths: int,
     max_depth: int,
+    enrich_top_k: Optional[int] = None,
     out_path: str,
 ) -> None:
     """
@@ -124,6 +125,7 @@ def generate_paths(
                         num_paths=num_paths,
                         max_depth=max_depth,
                         reranker=reranker if reranker is not None else None,
+                        enrich_top_k=enrich_top_k
                     )
                     rec = {
                         "instance_id": instance_id,
@@ -207,6 +209,11 @@ def parse_args() -> argparse.Namespace:
         "--rerank-checkpoint", type=str, default="gnn_reranker_final.pt",
         help="Enable reranking of generated paths"
     )
+    p.add_argument(
+        "--enrich_top_k", type=int, default=None,
+        help="Enrich only the top-k paths for context (None = all). "
+            "Use 1 to minimise context tokens while keeping full beam recall."
+    )
     return p.parse_args()
 
 
@@ -281,6 +288,7 @@ def main() -> None:
         max_depth=args.max_depth,
         out_path=os.path.join(args.out_dir, "predicted_paths_constrained.jsonl"),
         reranker=reranker if args.rerank_checkpoint else None,
+        enrich_top_k=args.enrich_top_k if args.enrich_top_k is not None else None,
     )
 
     # ------------------------------------------------------------------ #

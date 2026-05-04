@@ -207,6 +207,7 @@ class GCRProcessAgent:
 
         rerank: bool = False,
         reranker: Optional[dict] = None, 
+        enrich_top_k: Optional[int] = None
     ) -> dict:
         """
         Run constrained or unconstrained path generation and return paths
@@ -303,9 +304,11 @@ class GCRProcessAgent:
         if enrich:
             t2 = time.perf_counter()
 
+            k = enrich_top_k if enrich_top_k is not None else num_paths
+
             reified_paths = [
                 reify_generated_path(self, generated_string=p, anchor_object=anchor_object, G_context=G_context)
-                for p in paths[:num_paths]
+                for p in paths[:k]
             ]
             
             # Now context_block receives Event objects, not strings
