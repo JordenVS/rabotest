@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Dict, List
+from typing import Dict, List, Optional
 import networkx as nx
 
 from tqdm import tqdm
@@ -71,6 +71,7 @@ def generate_paths(
     *,
     constrained: bool,
     enrich: bool,
+    reranker: Optional[Dict] = None,
     G_context: nx.DiGraph,
     num_paths: int,
     max_depth: int,
@@ -122,6 +123,7 @@ def generate_paths(
                         G_context=G_context,
                         num_paths=num_paths,
                         max_depth=max_depth,
+                        reranker=reranker if reranker is not None else None,
                     )
                     rec = {
                         "instance_id": instance_id,
@@ -201,6 +203,10 @@ def parse_args() -> argparse.Namespace:
         "--skip_unconstrained", action="store_true",
         help="Skip the unconstrained ablation run (saves time)"
     )
+    p.add_argument(
+        "--rerank-checkpoint", type=str, default="gnn_reranker_final.pt",
+        help="Enable reranking of generated paths"
+    )
     return p.parse_args()
 
 
@@ -247,6 +253,21 @@ def main() -> None:
     )
     print("Agent ready.\n")
 
+    if args.rerank_checkpoint:
+        from rerank.train import load_reranker
+        print(f"Loading GNN reranker from checkpoint: {args.rerank_checkpoint}")
+        rerank_model, act_vocab, obj_vocab, edge_vocab = load_reranker(args.rerank_checkpoint)
+        print("Reranker loaded and ready.\n")
+
+        reranker = {
+        "model": rerank_model,
+        "act_vocab": act_vocab,
+        "obj_vocab": obj_vocab,
+        "edge_vocab": edge_vocab,
+        "device": args.device,
+        # context_snapshot is instance-specific — set it per question in generate_paths()
+    }
+
     # ------------------------------------------------------------------ #
     # 4. Constrained run (GCR proper)
     # ------------------------------------------------------------------ #
@@ -259,6 +280,7 @@ def main() -> None:
         num_paths=args.num_paths,
         max_depth=args.max_depth,
         out_path=os.path.join(args.out_dir, "predicted_paths_constrained.jsonl"),
+        reranker=reranker if args.rerank_checkpoint else None,
     )
 
     # ------------------------------------------------------------------ #

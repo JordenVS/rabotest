@@ -204,6 +204,9 @@ class GCRProcessAgent:
         num_paths: int = 3,
         max_depth: int = 5,
         max_new_tokens: int = 100,
+
+        rerank: bool = False,
+        reranker: Optional[dict] = None, 
     ) -> dict:
         """
         Run constrained or unconstrained path generation and return paths
@@ -278,6 +281,25 @@ class GCRProcessAgent:
             )
             generation_s = time.perf_counter() - t1
 
+            rerank_s = 0.0
+            if rerank and reranker is not None:
+                from gcr.rerank_integration import rerank_beam_paths
+                t_rerank = time.perf_counter()
+                paths = rerank_beam_paths(
+                    paths=paths,
+                    anchor_oid=anchor_object,
+                    question=question,
+                    context_snapshot=reranker["context_snapshot"],
+                    events=self.events,
+                    event_successors=self.event_successors,
+                    model=reranker["model"],
+                    act_vocab=reranker["act_vocab"],
+                    obj_vocab=reranker["obj_vocab"],
+                    edge_vocab=reranker["edge_vocab"],
+                    device_str=reranker.get("device", "cpu"),
+                )
+                rerank_s = time.perf_counter() - t_rerank
+
         if enrich:
             t2 = time.perf_counter()
 
@@ -310,8 +332,9 @@ class GCRProcessAgent:
             "paths":         paths,
             "trie_build_s":  trie_build_s,
             "generation_s":  generation_s,
+            "rerank_s":      rerank_s,           # new
             "enrich_s":      enrich_s,
-            "total_s":       trie_build_s + generation_s + enrich_s,
+            "total_s":       trie_build_s + generation_s + rerank_s + enrich_s,
             "prompt_tokens": prompt_tokens,
             "context_block": context_block,
         }
